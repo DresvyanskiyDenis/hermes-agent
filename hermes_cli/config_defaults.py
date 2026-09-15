@@ -1267,6 +1267,13 @@ DEFAULT_CONFIG = {
         # here is granted NOTHING — a child crossing to it carrying any toolset aborts the whole
         # delegate_task call. Empty default = no cross-provider child may carry tools until declared.
         "provider_toolsets": {},
+        # Models to try, best first, when a child's route hits a quota wall: it descends ONE entry per
+        # wall until the list runs out, then fails loud. Entries are model names (the child keeps its own
+        # provider) or {"model": ..., "provider": ...} to end the ladder somewhere else; the model a task
+        # started on must itself appear here, or there is no position to descend from and the wall is
+        # final. A task overrides this with its own `fallback` route, or opts out with fallback: "none".
+        # wall. Empty default = no descent, and a quota wall fails exactly as it does today.
+        "descent_order": [],
         # Per-subagent iteration cap (own budget, independent of the parent's).
         "max_iterations": 250,
         # Hard per-summary char ceiling on subagent results, layered on the dynamic budget (each

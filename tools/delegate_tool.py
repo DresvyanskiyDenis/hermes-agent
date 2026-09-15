@@ -11,6 +11,7 @@ the delegation call and the summary result, never the child's intermediate
 tool calls or reasoning.
 """
 
+import functools
 import logging
 import time
 import weakref
@@ -34,7 +35,9 @@ from tools.delegate_tool_config import (  # noqa: F401
     _resolve_child_runtime, _resolve_delegation_credentials,
     _subagent_auto_approve, _subagent_auto_deny,
 )
-from tools.delegate_tool_dispatch import _Batch, _announce_batch, _capture_origin, _run_batch
+from tools.delegate_tool_dispatch import (  # noqa: F401
+    _Batch, _Descent, _Rung, _announce_batch, _capture_origin, _run_batch,
+)
 from tools.delegate_tool_progress import (  # noqa: F401
     DelegateEvent, SUBAGENT_FAILURE_STATUSES, _batch_prefix, _build_child_progress_callback,
     _build_child_system_prompt, _clean_error_text, _emit_parent_console, _quiet, _resolve_workspace_hint,
@@ -483,6 +486,144 @@ def _task_pin_error(index: int, task: Dict[str, Any], exc: Exception) -> str:
     return f"Task {index} (pinned to '{pin}'): {exc}" if pin else str(exc)
 
 
+def _route_label(creds: Dict[str, Any]) -> str:
+    """``provider/model`` of a resolved route, for the switch stamp. A blank half inherited the parent's."""
+    return f"{creds.get('provider') or 'inherit'}/{creds.get('model') or 'inherit'}"
+
+
+def _same_route(a: tuple, b: tuple) -> bool:
+    """Route pins equal, case-insensitively; ``None`` (inherit) only matches ``None``."""
+    return [x.casefold() if isinstance(x, str) else x for x in a] == [
+        y.casefold() if isinstance(y, str) else y for y in b]
+
+
+def _route_pins(raw: Any, where: str) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """``({provider, model}, None)`` for one declared route, or ``(None, error)``.
+
+    One shape for both places a route is written down — a task's explicit ``fallback`` and a rung of
+    ``delegation.descent_order`` — so the two cannot disagree about what a route is. A bare string is the
+    common case (a model on the task's own provider); the dict form exists so a ladder can end somewhere
+    else entirely. ``where`` is the caller-facing name of the thing being validated.
+    """
+    if isinstance(raw, str):
+        model = _task_route_pin(raw)
+        if not model:
+            return None, f"{where} is blank. Name the model this route runs."
+        return {"provider": None, "model": model}, None
+    if not isinstance(raw, dict):
+        return None, (
+            f"{where} must be a model name or an object like "
+            f"{{\"model\": \"...\", \"provider\": \"...\"}}, got {type(raw).__name__}."
+        )
+    unsupported = sorted(set(raw) - {"model", "provider"})
+    if unsupported:
+        return None, (
+            f"{where} has unsupported key(s): {', '.join(unsupported)}. A route is {{model, provider}} and "
+            f"nothing else — toolsets, reasoning_effort, goal and context carry over from the task, so a "
+            f"descended child differs from the one it replaces in where it runs and nothing more."
+        )
+    model = _task_route_pin(raw.get("model"))
+    if not model:
+        return None, (
+            f"{where} is missing a 'model'. Name the model this route runs — an inherited model would "
+            f"re-run the walled route under a different name."
+        )
+    return {"provider": _task_route_pin(raw.get("provider")), "model": model}, None
+
+
+# A task opting out of descent entirely, spelled as a value rather than a key so "no fallback" and
+# "deliberately no fallback" stay distinguishable: the first inherits the ladder, the second refuses it.
+_FALLBACK_OPT_OUT = "none"
+
+
+def _task_fallback_mode(task: Dict[str, Any], index: int) -> tuple[str, Optional[Dict[str, Any]], Optional[str]]:
+    """``(mode, pins, error)`` for this task's ``fallback`` key.
+
+    ``mode`` is ``"ladder"`` (absent — walk delegation.descent_order), ``"none"`` (explicit opt-out, for
+    work that must not silently move provider) or ``"explicit"`` (this route and no other, one rung).
+
+    Fail closed, at validation time: a fallback dropped for being malformed would leave the caller
+    believing a quota wall is covered when it is not, and they would only find out at the wall.
+    """
+    raw = task.get("fallback")
+    if raw is None:
+        return "ladder", None, None
+    if isinstance(raw, str) and raw.strip().casefold() == _FALLBACK_OPT_OUT:
+        return "none", None, None
+    pins, err = _route_pins(raw, f"Task {index} 'fallback'")
+    if err:
+        return "explicit", None, (
+            f"{err} Use a model name, {{model, provider}}, or '{_FALLBACK_OPT_OUT}' to opt this task out "
+            f"of descent entirely."
+        )
+    # Deliberately NOT compared against the task's pins here: a fallback that names no provider inherits
+    # the task's, and a task that pins no provider inherits the batch's, so two routes that look different
+    # as pins can be the same route once resolved. The guard lives where both sides are resolved.
+    return "explicit", pins, None
+
+
+def _normalize_descent_order(routing_cfg: Dict[str, Any]) -> tuple[List[Dict[str, Any]], Optional[str]]:
+    """``delegation.descent_order`` as normalized route pins, or ``([], error)``.
+
+    The order is an OPERATOR statement of which model to try next when a quota wall closes the current
+    one — it exists nowhere else in the runtime, so an unparseable one aborts rather than degrading to no
+    ladder: silently losing the descent is indistinguishable, from the caller's side, from every rung
+    being walled. Duplicate models abort for the same reason position is looked up by model name.
+    """
+    raw = routing_cfg.get("descent_order") if isinstance(routing_cfg, dict) else None
+    if raw is None or raw == []:
+        return [], None
+    if not isinstance(raw, list):
+        return [], (
+            f"delegation.descent_order must be a list of models, ordered best-first, got "
+            f"{type(raw).__name__}."
+        )
+    order: List[Dict[str, Any]] = []
+    for position, entry in enumerate(raw):
+        pins, err = _route_pins(entry, f"delegation.descent_order[{position}]")
+        if err:
+            return [], err
+        if any(_same_route((p["provider"], p["model"]), (pins["provider"], pins["model"])) for p in order):
+            return [], (
+                f"delegation.descent_order[{position}] repeats {pins['model']!r}. A rung is found by model "
+                f"name, so a repeat has no single position to descend from."
+            )
+        order.append(pins)
+    return order, None
+
+
+def _descent_rungs(
+    creds_i: Dict[str, Any], mode: str, explicit: Optional[Dict[str, Any]], order: List[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], Optional[str]]:
+    """``(rung_pins_below_this_child, halt_reason)``.
+
+    Every branch that yields NO rungs names why, because "this task failed on a wall and did not descend"
+    is only actionable with the reason attached — an operator cannot tell a deliberate opt-out from a
+    model nobody added to the order from a ladder already at its bottom.
+    """
+    if mode == "none":
+        return [], f"the task set fallback: '{_FALLBACK_OPT_OUT}'"
+    if mode == "explicit":
+        return [explicit], None
+    if not order:
+        return [], "delegation.descent_order is not configured"
+    model = str(creds_i.get("model") or "").strip()
+    provider = str(creds_i.get("provider") or "").strip()
+    for position, rung in enumerate(order):
+        # A rung that named no provider matches on model alone: it is a step within whatever provider the
+        # task is already on, which is what an all-one-provider ladder wants.
+        if not _same_route((rung["model"],), (model,)):
+            continue
+        if rung["provider"] and not _same_route((rung["provider"],), (provider,)):
+            continue
+        below = order[position + 1:]
+        return (below, None) if below else (
+            [], f"{provider or 'inherit'}/{model} is the last rung of delegation.descent_order")
+    return [], (
+        f"{model or 'the inherited model'} is not in delegation.descent_order, so there is no rung below "
+        f"it to descend to")
+
+
 def _cross_provider_toolset_error(index: int, provider: str, child_toolsets: List[str]) -> Optional[str]:
     """Abort message when a child leaving the parent's provider carries toolsets that provider was never
     granted. Checked on the FINAL resolved list, so it holds for an explicit pin, for inheritance, and for
@@ -539,6 +680,11 @@ def _build_children(
     # construction loop needs is resolved HERE and carried in ``prepared`` — re-deriving any of it below
     # would mean the gate vetted one answer while the child was built from another, and the widest of the
     # two answers is the one that wins by default.
+    # Parsed once for the whole batch: it is operator config, identical for every task, and a broken one
+    # must abort before the first child is constructed rather than at the first wall.
+    descent_order, order_err = _normalize_descent_order(routing_cfg)
+    if order_err:
+        return [], order_err
     prepared: List[tuple] = []
     for i, t in enumerate(task_list):
         pinned_toolsets, toolsets_err = _task_toolsets(t, i, parent_universe)
@@ -561,9 +707,46 @@ def _build_children(
             provider_err = _cross_provider_toolset_error(i, child_provider, resolved_toolsets[0])
             if provider_err:
                 return [], provider_err
-        prepared.append((creds_i, routing_i, resolved_toolsets))
-    for i, t in enumerate(task_list):
-        creds_i, routing_i, resolved_toolsets = prepared[i]
+        # EVERY rung below this child is vetted HERE, on the same two gates the primary pin passed
+        # (resolvable credentials, and the cross-provider toolset grant against the SAME resolved toolsets
+        # the child really carries). Vetting a rung only when the walk reaches it would turn a quota wall
+        # into a second, differently-shaped failure three rungs down — and would let a task reach an
+        # ungranted provider by descending onto it. Resolution is cached per (provider, model), so a shared
+        # ladder costs one resolution per distinct rung for the whole batch, not one per task.
+        mode, explicit_pins, fb_err = _task_fallback_mode(t, i)
+        if fb_err:
+            return [], fb_err
+        rung_pins, halted = _descent_rungs(creds_i, mode, explicit_pins, descent_order)
+        rungs = []
+        for rung in rung_pins:
+            try:
+                creds_r, routing_r = _resolve_task_credentials(
+                    rung, creds, routing_cfg, parent_agent, task_creds_cache)
+            except ValueError as exc:
+                return [], f"Task {i} descent rung {rung['model']!r}: {exc}"
+            # Compared resolved, not as pins: a rung naming no provider inherits the child's, so
+            # ``fallback: "<the model I am already on>"`` only looks like a different route until both
+            # sides resolve. Descending onto the walled route buys nothing but a second wall.
+            if _same_route((creds_r.get("provider"), creds_r.get("model")),
+                           (creds_i.get("provider"), creds_i.get("model"))):
+                return [], (
+                    f"Task {i} 'fallback' resolves to {_route_label(creds_r)}, the same route the task "
+                    f"already runs on. A fallback onto the walled route buys nothing but a second wall — "
+                    f"point it at a different provider or model."
+                )
+            rung_provider = str(creds_r.get("provider") or "").strip()
+            if rung_provider and rung_provider.casefold() != parent_provider.casefold():
+                rung_err = _cross_provider_toolset_error(i, rung_provider, resolved_toolsets[0])
+                if rung_err:
+                    return [], f"Task {i} descent rung {rung['model']!r}: {rung_err}"
+            rungs.append(_Rung(_route_label(creds_r), creds_r, routing_r, resolved_toolsets))
+        prepared.append((creds_i, routing_i, resolved_toolsets, tuple(rungs), halted))
+    def _construct(i: int, t: Dict[str, Any], creds_i, routing_i, resolved_toolsets) -> tuple:
+        """``(child, None)`` for one task on one already-vetted route, or ``(None, error)``.
+
+        Shared by the primary build below and the fallback retry (via ``_FallbackRoute.build``) so a
+        retried child differs from the one it replaces in its route and nothing else.
+        """
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
         _child_context = t.get("context")
         if _task_schema is not None:
@@ -579,7 +762,7 @@ def _build_children(
             )
         except ValueError as exc:
             # Fail loud: one bad pin aborts the whole batch, no child runs, no silent parent fallback.
-            return [], _task_pin_error(i, t, exc)
+            return None, _task_pin_error(i, t, exc)
         if _task_schema is not None:
             with _quiet("Could not attach output schema to child %d", i):
                 child._delegate_output_schema = _task_schema
@@ -599,6 +782,20 @@ def _build_children(
             _ident_ref = getattr(child, "_progress_identity_ref", None)
             if isinstance(_ident_ref, dict):
                 _ident_ref["delegation_id"] = live_deleg_id
+        return child, None
+
+    for i, t in enumerate(task_list):
+        creds_i, routing_i, resolved_toolsets, rungs, halted = prepared[i]
+        child, err = _construct(i, t, creds_i, routing_i, resolved_toolsets)
+        if err:
+            return [], err
+        # Parked on the child (as _delegate_output_schema/_delegate_images are) so the dispatch layer needs
+        # no new plumbing. Attached even with zero rungs: a walled task that did NOT descend still owes the
+        # caller the reason, and ``halted`` is where it comes from.
+        child._delegate_descent = _Descent(
+            label=_route_label(creds_i), rungs=rungs, halted=halted,
+            build=functools.partial(_construct, i, t),
+        )
         children.append((i, t, child))
     return children, None
 
@@ -869,6 +1066,19 @@ DELEGATE_TASK_SCHEMA = {
                             "Optional thinking budget for THIS child only: low, medium, high, xhigh, or "
                             "'none'/'false' to disable thinking. Omit to use delegation.reasoning_effort, "
                             "else the parent's level. An unrecognized value aborts the WHOLE call naming this task.",
+                        ),
+                        "fallback": _p(
+                            "string",
+                            "Optional override of where THIS child goes when its route hits a quota wall "
+                            "(billing / rate limit / upstream rate limit). OMIT IT for the normal case: the "
+                            "child then descends delegation.descent_order, moving one model down per wall "
+                            "until the order runs out. Name a model ('qwen3.8-max') to use that ONE route "
+                            "instead of the ladder, or 'none' to opt this task out of descent entirely — do "
+                            "that for work that must not move provider. "
+                            "Only a quota wall ever moves a child: every other failure is returned as a "
+                            "failure and never retried, and an exhausted ladder fails loud. The goal, context, "
+                            "toolsets and reasoning_effort carry over unchanged. A malformed value aborts the "
+                            "WHOLE call naming this task.",
                         ),
                         "toolsets": _p(
                             "array",
