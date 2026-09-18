@@ -233,6 +233,7 @@ def _loaded_launchd_backend_jobs(
     if sys.platform != "darwin":
         return []
     import plistlib
+    from xml.parsers.expat import ExpatError
     from hermes_cli.gateway import _launchd_print_service_pid
     uid = os.getuid()  # windows-footgun: ok — darwin-only branch
     jobs: list[tuple[str, str, list[str], int | None]] = []
@@ -245,7 +246,12 @@ def _loaded_launchd_backend_jobs(
             try:
                 with open(plist_path, "rb") as f:
                     data = plistlib.load(f)
-            except (OSError, ValueError, plistlib.InvalidFileException):
+            # launchd's own parser tolerates XML that expat rejects (e.g. a comment
+            # containing `--`), and plistlib surfaces that as ExpatError — a bare
+            # Exception subclass, so neither ValueError nor InvalidFileException
+            # catches it. One such file anywhere in LaunchAgents aborted the whole
+            # update with a traceback; a plist we cannot read is never fatal here.
+            except (OSError, ValueError, plistlib.InvalidFileException, ExpatError):
                 continue
             if not isinstance(data, dict):
                 continue

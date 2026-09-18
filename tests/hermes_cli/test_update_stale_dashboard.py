@@ -976,6 +976,18 @@ class TestLaunchdSupervisedBackends:
             with open(path, "wb") as f:
                 plistlib.dump({"Label": label, "ProgramArguments": argv}, f)
         (agents / "broken.plist").write_bytes(b"not a plist")
+        # Strictly invalid XML that launchd still loads (a comment containing `--`):
+        # plistlib raises ExpatError here, not InvalidFileException, so it must be
+        # skipped like any other unreadable plist rather than aborting the scan.
+        (agents / "strict-xml-invalid.plist").write_bytes(
+            b'<?xml version="1.0" encoding="UTF-8"?>\n'
+            b"<!-- brew upgrade --cask -->\n"
+            b'<plist version="1.0"><dict>'
+            b"<key>Label</key><string>ai.hermes.commented</string>"
+            b"<key>ProgramArguments</key><array>"
+            b"<string>/opt/hermes/venv/bin/python</string><string>-m</string>"
+            b"<string>hermes_cli.main</string><string>dashboard</string>"
+            b"</array></dict></plist>\n")
 
         uid = 501
         probed: list[tuple[str, str]] = []
