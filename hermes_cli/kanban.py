@@ -359,25 +359,29 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if max_retries is not None and max_retries < 1:
         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "
                     "use 1 to trip on the first failure.", 2)
-    with kbc.connect_closing() as conn:
-        task_id = kb.create_task(
-            conn, title=args.title, body=body, assignee=args.assignee,
-            created_by=args.created_by or _profile_author(),
-            workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
-            project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
-            parents=tuple(args.parent or ()), triage=bool(getattr(args, "triage", False)),
-            idempotency_key=getattr(args, "idempotency_key", None),
-            max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
-            max_retries=max_retries, model_override=getattr(args, "model_override", None),
-            provider_override=getattr(args, "provider_override", None),
-            goal_mode=bool(getattr(args, "goal_mode", False)),
-            goal_max_turns=getattr(args, "goal_max_turns", None),
-            completion_contract=getattr(args, "completion_contract", None),
-            initial_status=getattr(args, "initial_status", "running"),
-            creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
-                             if is_dispatcher_owned_worker_context() else None),
-        )
-        task = kb.get_task(conn, task_id)
+    try:
+        with kbc.connect_closing() as conn:
+            task_id = kb.create_task(
+                conn, title=args.title, body=body, assignee=args.assignee,
+                created_by=args.created_by or _profile_author(),
+                workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
+                project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
+                parents=tuple(args.parent or ()), triage=bool(getattr(args, "triage", False)),
+                idempotency_key=getattr(args, "idempotency_key", None),
+                max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
+                max_retries=max_retries, model_override=getattr(args, "model_override", None),
+                provider_override=getattr(args, "provider_override", None),
+                reasoning_effort=getattr(args, "reasoning_effort", None),
+                goal_mode=bool(getattr(args, "goal_mode", False)),
+                goal_max_turns=getattr(args, "goal_max_turns", None),
+                completion_contract=getattr(args, "completion_contract", None),
+                initial_status=getattr(args, "initial_status", "running"),
+                creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
+                                 if is_dispatcher_owned_worker_context() else None),
+            )
+            task = kb.get_task(conn, task_id)
+    except ValueError as exc:
+        return _err(f"kanban: {exc}", 2)
     if getattr(args, "json", False):
         _print_json(_task_to_dict(task))
     else:
@@ -515,6 +519,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.model_override:
         _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
         field("model", f"{task.model_override}{_prov}")
+    if getattr(task, "reasoning_effort", None):
+        field("reasoning", task.reasoning_effort)
     # Effective retry threshold (task > config > default) explains auto-blocks.
     if task.max_retries is not None:
         print(f"  max-retries: {task.max_retries} (task)")
@@ -950,22 +956,35 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     title = getattr(args, "title", None)
     body = getattr(args, "body", None)
     priority = getattr(args, "priority", None)
+    effort = getattr(args, "reasoning_effort", None)
     if result is None and (summary is not None or raw_metadata is not None):
         return _err("kanban edit: --summary and --metadata require --result", 2)
-    if all(value is None for value in (title, body, priority, result)):
-        return _err("kanban edit: provide --title, --body, --priority, or --result", 2)
+    classic = any(value is not None for value in (title, body, priority, result))
+    if not classic and effort is None:
+        return _err("kanban edit: provide --title, --body, --priority, --result, or --reasoning-effort", 2)
     metadata, rc = _parse_metadata_flag(raw_metadata)
     if rc:
         return rc
-    with kbc.connect_closing() as conn:
-        ok = kb.edit_task(
-            conn, args.task_id, title=title, body=body, priority=priority,
-            result=result, summary=summary, metadata=metadata,
-        )
+    ok, msg = True, f"Edited {args.task_id}"
+    try:
+        if effort is not None:
+            level = None if effort.strip().lower() == "clear" else kb.normalize_reasoning_effort(effort)
+            msg += (f": reasoning-effort = {level} (applies on next dispatch)" if level
+                    else ": reasoning-effort cleared (profile default)")
+        with kbc.connect_closing() as conn:
+            if classic:
+                ok = kb.edit_task(
+                    conn, args.task_id, title=title, body=body, priority=priority,
+                    result=result, summary=summary, metadata=metadata,
+                )
+            if ok and effort is not None:
+                ok = kb.set_reasoning_effort(conn, args.task_id, level)
+    except (ValueError, RuntimeError) as exc:
+        return _err(f"kanban: {exc}", 2)
     return _ok_or_err(
         ok,
         f"cannot edit {args.task_id} (unknown id, or --result used on a task that is not done)",
-        f"Edited {args.task_id}",
+        msg,
     )
 
 

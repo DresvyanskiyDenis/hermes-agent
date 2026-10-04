@@ -203,6 +203,11 @@ _SPECS = [
         _arg("--provider", dest="provider_override",
              help="Provider the --model belongs to (passed as --provider <name> to "
                   "the worker). Requires --model."),
+        _arg("--reasoning-effort", metavar="LEVEL",
+             help="Per-task thinking depth for the dispatched worker (independent of "
+                  "--model). One of: none, minimal, low, medium, high, xhigh, max, "
+                  "ultra. Omit to use the profile's agent.reasoning_effort. The "
+                  "dispatcher passes it to the worker as --reasoning <level>."),
         _arg("--completion-contract", metavar="CONTRACT",
              help="local-only (default), OWNER/REPO for publication, or exact GitHub PR URL; required CI gates done."),
         _arg("--goal", action="store_true", dest="goal_mode",
@@ -309,6 +314,10 @@ _SPECS = [
         _arg("--title", help="Replace the task title"),
         _arg("--body", help="Replace the task body"),
         _arg("--priority", type=int, help="Replace the task priority"),
+        _arg("--reasoning-effort", metavar="LEVEL",
+             help="Set the per-task reasoning effort ('none' disables thinking on the "
+                  "worker; 'clear'/empty resets to the profile default). Takes effect "
+                  "on the next dispatch."),
         _arg("--result", help="Backfilled task result text for a done task"),
         *_STEP_HANDOFF,
     ], help="Edit task fields or recovery fields on an already-completed task"),
