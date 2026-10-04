@@ -527,6 +527,14 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "the profile's provider and will fail if it belongs "
                 "to a different one. Requires 'model'."
         )),
+        "reasoning_effort": _prop("string", (
+                "Per-task thinking depth for the dispatched worker, "
+                "independent of 'model' pinning. One of none, minimal, "
+                "low, medium, high, xhigh, max, ultra ('none' disables "
+                "thinking). Omit to inherit the assignee profile's "
+                "agent.reasoning_effort. Validated at create time: an "
+                "unrecognized value is rejected and the call errors."
+        )),
     },
     ["title", "assignee"],
 )
