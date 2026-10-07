@@ -893,11 +893,8 @@ class DockerEnvironment(BaseEnvironment):
         self._all_run_args = all_run_args
         self._network = network
 
-        reused = persist_across_processes and self._attach_existing_container(
-            task_label, profile_name, egress_label, network)
-        if not reused:
-            reused = self._adopt_or_refuse_mount_conflict()
-        if not reused:
+        self._container_id = persist_across_processes and self._attach_existing_container()
+        if not self._container_id and not self._adopt_or_refuse_mount_conflict():
             self._container_id = self._docker_run(cwd)
 
         # Init-time env forwarding args seed the snapshot.
@@ -1046,16 +1043,19 @@ class DockerEnvironment(BaseEnvironment):
             logger.debug("Skipping docker cwd mount: /workspace already mounted by user config")
         return volume_args, writable_args
 
-    def _attach_existing_container(self, task_label, profile_name, egress_label, network: bool) -> bool:
-        """Attach to a prior process's labeled container ("ONE long-lived container shared
-        across sessions"; opt out via ``docker_persist_across_processes: false``).
+    def _attach_existing_container(self) -> str | None:
+        """Id of the existing container of our identity, started unless running, or ``None`` when
+        a fresh one must run ("ONE long-lived container shared across sessions"; opt out via
+        ``docker_persist_across_processes: false``): the holder of our canonical name, else a
+        container from before canonical names, found by the labels those processes used.
         Network guard is lockdown-only: a bridge container under ``docker_network: false``
         is removed and recreated, but a ``none`` container under default config is kept so
         ``--network=none`` in extra args doesn't churn containers every startup."""
-        existing = self._find_reusable_container(task_label, profile_name, egress_label)
+        existing = self._named_container() or self._find_reusable_container()
         if existing is None:
-            return False
+            return None
         container_id, state = existing
+        task_label, profile_name = self._labels["hermes-task-id"], self._labels["hermes-profile"]
         # A container built from another image. Explicitly configured image (config.yaml /
         # TERMINAL_DOCKER_IMAGE): the user changed it, so the old container is not their sandbox any
         # more — recreate (the image is immutable after creation). Default image: a default flip
@@ -1089,8 +1089,8 @@ class DockerEnvironment(BaseEnvironment):
                     run_capture([self._docker_exe, "rm", "-f", container_id], timeout=30)
                 except (subprocess.TimeoutExpired, OSError) as e:
                     logger.warning("Failed to remove mismatched container %s: %s", container_id[:12], e)
-                return False
-        if not network:
+                return None
+        if not self._network:
             actual_mode = self._container_network_mode(container_id)
             if actual_mode != "none":
                 logger.warning(
@@ -1102,26 +1102,18 @@ class DockerEnvironment(BaseEnvironment):
                     run_capture([self._docker_exe, "rm", "-f", container_id], timeout=30)
                 except (subprocess.TimeoutExpired, OSError) as e:
                     logger.warning("Failed to remove mismatched container %s: %s", container_id[:12], e)
-                return False
+                return None
 
-        if state != "running":
-            # Every start is mount-gated: after a daemon restart another bucket's spawn may already
-            # have brought this jail's paths back up. Adopt that twin (or refuse) instead of starting
-            # a second holder; a refusal propagates and fails the spawn.
-            if self._adopt_or_refuse_mount_conflict():
-                return True
-            err = self._start_container(container_id)
-            if err is not None:
-                logger.warning(
-                    "Failed to start existing container %s (state=%s): "
-                    "%s — falling back to a fresh container.",
-                    container_id[:12], state, err)
-                return False
-        self._container_id = container_id
+        # Every start is mount-gated: after a daemon restart another bucket's spawn may already
+        # have brought this jail's paths back up. Adopt that twin (or refuse) instead of starting
+        # a second holder; a refusal propagates and fails the spawn.
+        if state != "running" and self._adopt_or_refuse_mount_conflict():
+            return self._container_id
+        self._ensure_running(container_id, state)
         logger.info(
             "Reusing container %s (task=%s, profile=%s, prior state=%s)",
             container_id[:12], task_label, profile_name, state)
-        return True
+        return container_id
 
     def _adopt_or_refuse_mount_conflict(self, replace: bool = True, exclude: str | None = None) -> bool:
         """Mount gate for every spawn that misses label reuse and every ``docker start`` of a hermes
@@ -1487,44 +1479,17 @@ class DockerEnvironment(BaseEnvironment):
         return any(p in output for p in self._NO_CONTAINER_PATTERNS)
 
     def _recreate_container(self) -> bool:
-        """Recover a container stopped or removed out-of-band. The mount gate runs first, so nothing
-        below starts a second holder of a jail another process already brought back up: it adopts
-        that container or refuses. Then our previous container is restarted — after a daemon
-        restart it still exists, stopped, and may be a jail adopted under another task's labels that
-        the label search would miss. Only then label-based reuse (another process may have
-        recreated it), else a fresh one from the saved image/run-args. False when recovery fails
-        so the caller surfaces the original error."""
-        prev = self._container_id
-        logger.warning("Container %s appears to be gone — attempting recovery", (prev or "")[:12])
-        self._container_id = None
+        """Recover a container stopped or removed out-of-band exactly as a spawn finds its
+        container: start the holder of our canonical name in whatever state (the one we had, or
+        the one a sibling recreated), else run a fresh one under that name. False when recovery
+        fails so the caller surfaces the original error; the gone id is kept, so the next exec
+        fails as container-gone and retries (a ``None`` id would assert "Container not started")."""
+        logger.warning("Container %s appears to be gone — attempting recovery", (self._container_id or "")[:12])
         try:
-            recovered = self._adopt_or_refuse_mount_conflict(replace=False, exclude=prev)
-        except RuntimeError as e:
-            # Keep the gone id: later execs fail as container-gone and retry recovery, where a
-            # None id would assert "Container not started" forever.
-            self._container_id = prev
-            logger.error("Recovery refused (retried on the next exec): %s", e)
+            self._container_id = self._attach_existing_container() or self._docker_run(self.cwd)
+        except (RuntimeError, subprocess.SubprocessError, OSError) as e:
+            logger.error("Recovery failed (retried on the next exec): %s", e)
             return False
-        recovered = recovered or (bool(prev) and self._claim_for_recovery(prev, "exited"))
-        if not recovered and (existing := self._find_reusable_container(
-                self._labels.get("hermes-task-id", ""),
-                self._labels.get("hermes-profile", ""),
-                self._labels.get(_EGRESS_LABEL_KEY, "off"))) is not None:
-            recovered = self._claim_for_recovery(*existing)
-        if not recovered:
-            if not self._image:
-                logger.error("Recovery: no saved image name, cannot recreate container")
-                return False
-            try:
-                new_name = f"hermes-{uuid.uuid4().hex[:8]}"
-                result = run_capture(
-                    self._run_command(new_name, self.cwd), timeout=120, check=True,
-                    env=self._docker_client_env(self._run_env_values))
-                self._container_id = result.stdout.strip()
-                logger.info("Recovery: created fresh container %s (%s)", new_name, self._container_id[:12])
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
-                logger.error("Recovery: failed to create new container: %s", e)
-                return False
 
         try:
             self._snapshot_ready = False
@@ -1533,17 +1498,8 @@ class DockerEnvironment(BaseEnvironment):
             logger.error("Recovery: init_session failed in new container: %s", e)
             return False
 
-        logger.info("Recovery successful — new container %s", (self._container_id or "")[:12])
+        logger.info("Recovery successful — container %s", self._container_id[:12])
         self._mark_recreated()
-        return True
-
-    def _claim_for_recovery(self, cid: str, state: str) -> bool:
-        """Make *cid* ours, starting it unless it is already running."""
-        if state != "running" and (err := self._start_container(cid)) is not None:
-            logger.warning("Recovery: failed to start container %s: %s", cid[:12], err)
-            return False
-        self._container_id = cid
-        logger.info("Recovery: %s container %s", "reusing running" if state == "running" else "restarted", cid[:12])
         return True
 
     def execute(self, command: str, cwd: str = "", **kwargs) -> dict:
@@ -1606,20 +1562,17 @@ class DockerEnvironment(BaseEnvironment):
             fail="docker inspect NetworkMode failed: %s", nonzero="docker inspect NetworkMode returned %d: %s")
         return (result.stdout.strip() or None) if result is not None else None
 
-    def _find_reusable_container(
-        self, task_label: str, profile_label: str, egress_label: str) -> Optional[tuple[str, str]]:
-        """``(container_id, state)`` of an existing container labeled for this task/profile/
-        egress posture and immutable environment, or ``None`` on miss or any failure.
-        Explicit shared keys opt out of the environment filter. The egress posture is a label
+    def _find_reusable_container(self) -> Optional[tuple[str, str]]:
+        """``(container_id, state)`` of a container from before canonical names labeled for this
+        task/profile/egress posture and legacy environment fingerprint, or ``None`` on miss or any
+        failure. Explicit shared keys opt out of the environment filter. The egress posture is a label
         FILTER for every posture, "off" included: a container built with egress on must not be
         reused after ``hermes egress disable`` (baked-in proxy env and CA mounts), and every
         container this class creates carries the label. The ``{{.Label "key"}}`` template
         function is Docker-only — podman ps exits 125 on it — so the probe never uses it (#99213)."""
-        filters = [
-            "--filter", "label=hermes-agent=1",
-            "--filter", f"label=hermes-task-id={task_label}",
-            "--filter", f"label=hermes-profile={profile_label}",
-            "--filter", f"label={_EGRESS_LABEL_KEY}={egress_label}"]
+        filters = ["--filter", "label=hermes-agent=1", *(
+            arg for key in ("hermes-task-id", "hermes-profile", _EGRESS_LABEL_KEY)
+            for arg in ("--filter", f"label={key}={self._labels[key]}"))]
         if self._legacy_fingerprint:
             filters.extend(["--filter", f"label={_ENVIRONMENT_LABEL_KEY}={self._legacy_fingerprint}"])
         result = _docker_query(

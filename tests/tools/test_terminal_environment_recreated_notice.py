@@ -32,19 +32,8 @@ def test_docker_recovery_marks_pending_and_finalizer_warns(monkeypatch):
     when the backend never flagged a recreation."""
     env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
     env._container_id = "old"
-    env._labels = {}
-    env._image = ""
-    # Recovery now runs the mount gate first, then restarts its own container; this fixture
-    # is about the recreation notice, so both probes are stubbed to "nothing found / gone".
     monkeypatch.setattr(
-        docker_env.DockerEnvironment, "_adopt_or_refuse_mount_conflict",
-        lambda self, replace=True, exclude=None: False)
-    monkeypatch.setattr(
-        docker_env.DockerEnvironment, "_start_container",
-        lambda self, cid: RuntimeError("No such container"))
-    monkeypatch.setattr(
-        docker_env.DockerEnvironment, "_find_reusable_container",
-        lambda self, *a: ("newcid", "running"))
+        docker_env.DockerEnvironment, "_attach_existing_container", lambda self: "newcid")
     monkeypatch.setattr(docker_env.DockerEnvironment, "init_session", lambda self: None)
     assert env._recreate_container() is True
     assert getattr(env, "_recreated_notice_pending", False) is True
