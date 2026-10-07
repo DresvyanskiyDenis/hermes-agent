@@ -155,8 +155,8 @@ same_container "$idX" "$idY" && fail "forge started the stopped default jail $id
 [ "$(docker inspect --format '{{.State.Running}}' "$idY")" = true ] || fail "forge container $idY not running"
 idZ=$(spawn default "$E:/home/bot") || fail "scenario E default respawn crashed"
 same_container "$idY" "$idZ" || fail "default got $idZ, not the running forge jail $idY"
-[ "$(holders "$E")" = 1 ] || fail "$(holders "$E") running containers mount $E (want 1)"
 echo "PASS restart-order-forge-first-default-converges"
+assert_single_jail "$E"
 
 # E2: the daemon restarts under a live process. Its default env adopted forge's container (labels
 # not its own), so label search would miss it: recovery must restart that container, not run anew.
@@ -176,7 +176,6 @@ read -r before after alive <<<"$out"
 [ "$alive" = True ] || fail "exec after recovery did not run: $out"
 same_container "$idY" "$before" || fail "E2 env attached $before, not the jail $idY"
 [ "$before" = "$after" ] || fail "recovery switched $before to $after instead of restarting it"
-[ "$(holders "$E")" = 1 ] || fail "$(holders "$E") running containers mount $E after recovery (want 1)"
 echo "PASS recovery-restarts-adopted-jail"
 assert_single_jail "$A" "$C" "$E"
 
