@@ -7,17 +7,14 @@ import subprocess
 
 import pytest
 
-from tools.environments import base as env_base
 from tools.environments import docker as docker_env
 from tools.environments.path_utils import sanitize_task_id_for_path
 
 
-# --- Jail duplicate-mount guard (t_44fdd37a) ---
-
-def _jail_candidate(sandbox, *, profile="bot_1", egress="off", image="python:3.11", net="default",
+def _jail_candidate(tmp_path, *, profile="bot_1", egress="off", image="python:3.11", net="default",
                     task="default", extra=()):
     """Inspect answers for a running persistent jail held under *task*'s sandbox bucket."""
-    bucket = sandbox / "docker" / sanitize_task_id_for_path(task)
+    bucket = tmp_path / "sandboxes" / "docker" / sanitize_task_id_for_path(task)
     for sub in ("home", "workspace"):
         (bucket / sub).mkdir(parents=True, exist_ok=True)
     binds = [(str(bucket / "home"), "/root"), (str(bucket / "workspace"), "/workspace"),
@@ -30,20 +27,21 @@ def _jail_candidate(sandbox, *, profile="bot_1", egress="off", image="python:3.1
 
 
 def _mock_jail_guard(monkeypatch, tmp_path, candidates, *, conflict_ps_rc=0):
-    """Label-reuse probe always misses; the conflict probe lists *candidates* (cid -> answers).
-    Returns (calls, sandbox root)."""
-    sandbox = tmp_path / "sandboxes"
-    sandbox.mkdir(exist_ok=True)
-    monkeypatch.setattr(env_base, "get_sandbox_dir", lambda: sandbox)
+    """Label-reuse probe always misses; the conflict probe lists *candidates* (cid -> answers,
+    ``"raw"`` overriding the labels+mounts inspect output). Returns the captured argv list."""
+    monkeypatch.setenv("TERMINAL_SANDBOX_DIR", str(tmp_path / "sandboxes"))
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "bot_1")
     monkeypatch.setattr(docker_env, "_readonly_skill_mount_args", lambda: [])
     docker_env._cgroup_limits_ok = True
     calls = []
-    formats = {"{{json .Config.Labels}}": lambda c: json.dumps(c["labels"]),
-               "{{json .Mounts}}": lambda c: c["mounts"] if isinstance(c["mounts"], str) else json.dumps(c["mounts"]),
-               "{{.Config.Image}}": lambda c: c["image"],
-               "{{.HostConfig.NetworkMode}}": lambda c: c["net"]}
+
+    def _inspect(c, fmt):
+        if fmt == "{{.Config.Image}}":
+            return c["image"]
+        if fmt == "{{.HostConfig.NetworkMode}}":
+            return c["net"]
+        return c.get("raw") or json.dumps({"labels": c["labels"], "mounts": c["mounts"]})
 
     def _run(cmd, **kwargs):
         calls.append(list(cmd))
@@ -57,13 +55,13 @@ def _mock_jail_guard(monkeypatch, tmp_path, candidates, *, conflict_ps_rc=0):
             assert "status=running" in cmd and not any("hermes-task-id=" in a for a in cmd)
             return done(conflict_ps_rc, "\n".join(candidates))
         if sub == "inspect" and cmd[-1] in candidates:
-            return done(out=formats[cmd[cmd.index("--format") + 1]](candidates[cmd[-1]]))
+            return done(out=_inspect(candidates[cmd[-1]], cmd[cmd.index("--format") + 1]))
         if sub == "run":
             return done(out="fresh-cid\n")
         return done()
 
     monkeypatch.setattr(docker_env.subprocess, "run", _run)
-    return calls, sandbox
+    return calls
 
 
 def _jail_spawn(**kwargs):
@@ -79,8 +77,7 @@ def _docker_runs(calls):
 def test_jail_guard_adopts_when_only_task_bucket_differs(monkeypatch, tmp_path):
     """The live leak: a ``profile:forge`` spawn missed the ``default``-labeled jail and
     double-mounted /srv/jail. Identical mounts modulo the sandbox bucket must adopt it."""
-    sandbox = tmp_path / "sandboxes"
-    calls, _ = _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": _jail_candidate(sandbox)})
+    calls = _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": _jail_candidate(tmp_path)})
 
     env = _jail_spawn()
 
@@ -92,38 +89,49 @@ def test_jail_guard_adopts_when_only_task_bucket_differs(monkeypatch, tmp_path):
 def test_jail_guard_adopts_regardless_of_inspect_mount_order(monkeypatch, tmp_path):
     """``docker inspect`` lists ``.Mounts`` in map order, not argv order: a live jail with the
     skills/cache binds came back shuffled, so an argv-ordered comparison never adopted."""
-    sandbox = tmp_path / "sandboxes"
-    candidate = _jail_candidate(sandbox)
+    candidate = _jail_candidate(tmp_path)
     candidate["mounts"].reverse()
-    calls, _ = _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": candidate})
+    calls = _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": candidate})
 
     assert _jail_spawn()._container_id == "jail-cid"
     assert not _docker_runs(calls)
 
 
-def test_jail_guard_same_profile_egress_mismatch_refuses(monkeypatch, tmp_path):
-    sandbox = tmp_path / "sandboxes"
-    calls, _ = _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": _jail_candidate(sandbox, egress="eg123")})
+@pytest.mark.parametrize("candidate_kw, spawn_kw", [
+    ({"egress": "eg123"}, {}),
+    ({"extra": [("/srv/extra", "/data")]}, {}),
+    # tmpfs /root cannot be proven equivalent to a bound /root, so adoption is impossible.
+    ({}, {"persistent_filesystem": False}),
+    ({"net": "bridge"}, {"network": False}),
+    ({"image": "other:tag"}, {"image_pinned": True}),
+], ids=["egress-mismatch", "extra-mount", "tmpfs-spawn", "air-gap-vs-bridge", "pinned-image-mismatch"])
+def test_jail_guard_same_profile_conflicting_identity_refuses(monkeypatch, tmp_path, candidate_kw, spawn_kw):
+    calls = _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": _jail_candidate(tmp_path, **candidate_kw)})
 
     with pytest.raises(RuntimeError, match="already bind-mounted read-write") as err:
-        _jail_spawn()
+        _jail_spawn(**spawn_kw)
     assert "/srv/jail" in str(err.value) and "jail-cid" in str(err.value)
     assert not _docker_runs(calls)
 
 
-def test_jail_guard_same_profile_extra_mount_refuses(monkeypatch, tmp_path):
-    sandbox = tmp_path / "sandboxes"
-    candidate = _jail_candidate(sandbox, extra=[("/srv/extra", "/data")])
-    calls, _ = _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": candidate})
+@pytest.mark.parametrize("candidate_kw, spawn_kw, mock_kw", [
+    # A read-only second reader is a legitimate access pattern, never a conflict.
+    ({"egress": "eg123"}, {"volumes": ["/srv/jail:/home/bot:ro"]}, {}),
+    ({"egress": "eg123"}, {}, {"conflict_ps_rc": 125}),
+    ({"egress": "eg123", "raw": "not-json"}, {}, {}),
+    ({"mounts": [{"Type": "bind", "Source": "/srv/other", "Destination": "/data", "RW": True}]}, {}, {}),
+], ids=["readonly-spawn", "probe-failure", "unparseable-candidate", "disjoint-jail"])
+def test_jail_guard_proceeds_with_fresh_container(monkeypatch, tmp_path, candidate_kw, spawn_kw, mock_kw):
+    candidate = _jail_candidate(tmp_path, egress=candidate_kw.pop("egress", "off"))
+    calls = _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": {**candidate, **candidate_kw}}, **mock_kw)
 
-    with pytest.raises(RuntimeError, match="already bind-mounted read-write"):
-        _jail_spawn()
-    assert not _docker_runs(calls)
+    env = _jail_spawn(**spawn_kw)
+
+    assert env._container_id == "fresh-cid" and _docker_runs(calls)
 
 
 def test_jail_guard_foreign_profile_overlap_warns_and_proceeds(monkeypatch, tmp_path, caplog):
-    sandbox = tmp_path / "sandboxes"
-    calls, _ = _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": _jail_candidate(sandbox, profile="other")})
+    calls = _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": _jail_candidate(tmp_path, profile="other")})
 
     with caplog.at_level(logging.WARNING, logger="tools.environments.docker"):
         env = _jail_spawn()
@@ -132,19 +140,8 @@ def test_jail_guard_foreign_profile_overlap_warns_and_proceeds(monkeypatch, tmp_
     assert "/srv/jail" in caplog.text
 
 
-def test_jail_guard_readonly_spawn_vs_rw_jail_proceeds(monkeypatch, tmp_path):
-    """A read-only second reader is a legitimate access pattern, never a conflict."""
-    sandbox = tmp_path / "sandboxes"
-    calls, _ = _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": _jail_candidate(sandbox, egress="eg123")})
-
-    env = _jail_spawn(volumes=["/srv/jail:/home/bot:ro"])
-
-    assert env._container_id == "fresh-cid" and _docker_runs(calls)
-
-
 def test_jail_guard_persist_across_processes_false_skips_probe(monkeypatch, tmp_path):
-    sandbox = tmp_path / "sandboxes"
-    calls, _ = _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": _jail_candidate(sandbox, egress="eg123")})
+    calls = _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": _jail_candidate(tmp_path, egress="eg123")})
 
     env = _jail_spawn(persist_across_processes=False)
 
@@ -152,52 +149,9 @@ def test_jail_guard_persist_across_processes_false_skips_probe(monkeypatch, tmp_
     assert env._container_id == "fresh-cid"
 
 
-def test_jail_guard_probe_failure_falls_back(monkeypatch, tmp_path):
-    sandbox = tmp_path / "sandboxes"
-    calls, _ = _mock_jail_guard(
-        monkeypatch, tmp_path, {"jail-cid": _jail_candidate(sandbox, egress="eg123")}, conflict_ps_rc=125)
-
-    env = _jail_spawn()
-
-    assert env._container_id == "fresh-cid" and _docker_runs(calls)
-
-
-def test_jail_guard_unparseable_candidate_skipped(monkeypatch, tmp_path):
-    sandbox = tmp_path / "sandboxes"
-    candidate = dict(_jail_candidate(sandbox, egress="eg123"), mounts="not-json")
-    calls, _ = _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": candidate})
-
-    env = _jail_spawn()
-
-    assert env._container_id == "fresh-cid" and _docker_runs(calls)
-
-
-def test_jail_guard_disjoint_running_jail_proceeds(monkeypatch, tmp_path):
-    candidate = {"labels": {"hermes-agent": "1", "hermes-profile": "bot_1", "hermes-task-id": "default",
-                            "hermes-egress": "off"},
-                 "mounts": [{"Type": "bind", "Source": "/srv/other", "Destination": "/data", "RW": True}],
-                 "image": "python:3.11", "net": "default"}
-    calls, _ = _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": candidate})
-
-    env = _jail_spawn()
-
-    assert env._container_id == "fresh-cid" and _docker_runs(calls)
-
-
-def test_jail_guard_tmpfs_spawn_vs_persistent_jail_refuses(monkeypatch, tmp_path):
-    """tmpfs /root cannot be proven equivalent to a bound /root, so adoption is impossible."""
-    sandbox = tmp_path / "sandboxes"
-    calls, _ = _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": _jail_candidate(sandbox)})
-
-    with pytest.raises(RuntimeError, match="already bind-mounted read-write"):
-        _jail_spawn(persistent_filesystem=False)
-    assert not _docker_runs(calls)
-
-
 def test_jail_guard_two_adoptables_take_first_and_warn_second(monkeypatch, tmp_path, caplog):
-    sandbox = tmp_path / "sandboxes"
-    candidates = {"cidA": _jail_candidate(sandbox), "cidB": _jail_candidate(sandbox)}
-    calls, _ = _mock_jail_guard(monkeypatch, tmp_path, candidates)
+    candidates = {"cidA": _jail_candidate(tmp_path), "cidB": _jail_candidate(tmp_path)}
+    calls = _mock_jail_guard(monkeypatch, tmp_path, candidates)
 
     with caplog.at_level(logging.WARNING, logger="tools.environments.docker"):
         env = _jail_spawn()
@@ -206,28 +160,9 @@ def test_jail_guard_two_adoptables_take_first_and_warn_second(monkeypatch, tmp_p
     assert "cidB" in caplog.text
 
 
-def test_jail_guard_air_gap_vs_bridge_candidate_refuses(monkeypatch, tmp_path):
-    sandbox = tmp_path / "sandboxes"
-    calls, _ = _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": _jail_candidate(sandbox, net="bridge")})
-
-    with pytest.raises(RuntimeError, match="already bind-mounted read-write"):
-        _jail_spawn(network=False)
-    assert not _docker_runs(calls)
-
-
-def test_jail_guard_pinned_image_mismatch_refuses(monkeypatch, tmp_path):
-    sandbox = tmp_path / "sandboxes"
-    calls, _ = _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": _jail_candidate(sandbox, image="other:tag")})
-
-    with pytest.raises(RuntimeError, match="already bind-mounted read-write"):
-        _jail_spawn(image_pinned=True)
-    assert not _docker_runs(calls)
-
-
 def test_jail_guard_unpinned_image_mismatch_adopts(monkeypatch, tmp_path, caplog):
     """Keep-existing-sandbox policy, as label reuse applies to a default-image flip."""
-    sandbox = tmp_path / "sandboxes"
-    calls, _ = _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": _jail_candidate(sandbox, image="other:tag")})
+    calls = _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": _jail_candidate(tmp_path, image="other:tag")})
 
     with caplog.at_level(logging.WARNING, logger="tools.environments.docker"):
         env = _jail_spawn(image_pinned=False)
@@ -250,7 +185,6 @@ def test_jail_guard_canonical_bind_source_tokenizes_sandbox_buckets(tmp_path):
     assert canonical(str(default_home), resolved_root) == canonical(str(home), resolved_root)
     assert canonical("/nonexistent/jail/", resolved_root) == "/nonexistent/jail"
     assert canonical("rel/dir/", resolved_root) == "rel/dir"
-    assert canonical(str(home), None) == os.path.realpath(home)
 
 
 @pytest.mark.require_symlinks

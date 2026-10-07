@@ -627,16 +627,13 @@ _HARDENING_TMPFS = frozenset(
     arg.split(":", 1)[0] for arg in (*_BASE_SECURITY_ARGS, *_RUN_TMPFS_NOEXEC) if arg.startswith("/"))
 
 
-def _persistent_sandbox_root() -> str | None:
-    """Resolved parent of the per-task persistent sandbox dirs, or ``None`` when unknown."""
-    try:
-        from tools.environments.base import get_sandbox_dir
-    except ImportError:
-        return None
+def _persistent_sandbox_root() -> str:
+    """Resolved parent of the per-task persistent sandbox dirs."""
+    from tools.environments.base import get_sandbox_dir
     return os.path.realpath(get_sandbox_dir() / "docker")
 
 
-def _canonical_bind_source(path: str, sandbox_root: str | None) -> str:
+def _canonical_bind_source(path: str, sandbox_root: str) -> str:
     """Host bind source as jail identity: ``~`` expanded, slash style folded, symlinks resolved
     when the path exists, and ``<sandbox_root>/<task bucket>/rest`` collapsed to
     ``<sandbox>/rest`` — the bucket is the one component two task buckets of the same jail
@@ -644,7 +641,7 @@ def _canonical_bind_source(path: str, sandbox_root: str | None) -> str:
     source = _host_path_key(os.path.expanduser(path))
     if os.path.exists(source):
         source = os.path.realpath(source)
-    if sandbox_root and source.startswith(sandbox_root + os.sep):
+    if source.startswith(sandbox_root + os.sep):
         rest = source[len(sandbox_root) + 1:].partition(os.sep)[2]
         return f"{_SANDBOX_TOKEN}/{rest}" if rest else _SANDBOX_TOKEN
     return source
@@ -658,9 +655,8 @@ def _parse_mount_pair_args(run_args: list[str]) -> tuple[list[tuple[str, str, bo
     for flag, spec in zip(run_args, run_args[1:]):
         if flag in ("-v", "--volume"):
             parsed = _split_volume_spec(spec)
-            if parsed:
-                mode = spec.strip()[len(parsed[0]) + len(parsed[1]) + 2:]
-                binds.append((*parsed, "ro" not in mode.split(",")))
+            if parsed:  # without a mode the last field is the destination, never "ro"
+                binds.append((*parsed, "ro" not in spec.rpartition(":")[2].split(",")))
         elif flag == "--mount":
             opts = dict(kv.partition("=")[::2] for kv in spec.split(","))
             dest = opts.get("destination") or opts.get("dst") or opts.get("target", "")
@@ -677,7 +673,7 @@ def _parse_mount_pair_args(run_args: list[str]) -> tuple[list[tuple[str, str, bo
     return binds, has_tmpfs
 
 
-def _bind_model(binds, sandbox_root: str | None) -> list[tuple[str, str, bool]]:
+def _bind_model(binds, sandbox_root: str) -> list[tuple[str, str, bool]]:
     """Canonical ``(source, destination, rw)`` binds sorted by destination; per-process tempdir
     sources (the symlink-safe skills copy) are random per process and carry no jail identity.
     Sorted because ``docker inspect`` lists ``.Mounts`` in map order, not argv order (Docker
@@ -1055,6 +1051,7 @@ class DockerEnvironment(BaseEnvironment):
         root = _persistent_sandbox_root()
         binds, has_tmpfs = _parse_mount_pair_args(self._all_run_args)
         ours = _bind_model(binds, root)
+        our_rw = {source for source, _, rw in ours if rw}
         result = _docker_query(
             [self._docker_exe, "ps", "--filter", "label=hermes-agent=1", "--filter", "status=running",
              "--format", "{{.ID}}"], timeout=10,
@@ -1066,36 +1063,33 @@ class DockerEnvironment(BaseEnvironment):
         for cid in result.stdout.split():
             if cid == self._container_id:
                 continue
-            labels = self._inspect_json(cid, "{{json .Config.Labels}}")
-            mounts = self._inspect_json(cid, "{{json .Mounts}}")
-            if not isinstance(labels, dict) or not isinstance(mounts, list):
-                logger.debug("Mount-conflict probe skipping %s: unreadable inspect output", cid[:12])
+            candidate = self._inspect_jail_candidate(cid, root)
+            if candidate is None:
                 continue
-            theirs = _bind_model([
-                (m.get("Source", ""), m.get("Destination", ""), m.get("RW") is True)
-                for m in mounts if isinstance(m, dict) and m.get("Type") == "bind"], root)
+            labels, theirs = candidate
             same_profile = labels.get("hermes-profile") == self._labels["hermes-profile"]
-            if (same_profile and theirs and theirs == ours and not has_tmpfs
-                    and labels.get(_EGRESS_LABEL_KEY) == self._labels[_EGRESS_LABEL_KEY]
-                    and self._runtime_adoptable(cid)):
-                if adopted is None:
-                    adopted = (cid, labels)
-                else:
-                    logger.warning(
-                        "Container %s duplicates adopted jail %s (same profile and mounts) — stale "
-                        "duplicate, remove it with `docker rm -f %s`", cid[:12], adopted[0][:12], cid[:12])
+            same_jail = (same_profile and theirs and theirs == ours and not has_tmpfs
+                         and labels.get(_EGRESS_LABEL_KEY) == self._labels[_EGRESS_LABEL_KEY])
+            if same_jail and adopted is not None:
+                logger.warning(
+                    "Container %s duplicates adopted jail %s (same profile and mounts) — stale "
+                    "duplicate, remove it with `docker rm -f %s`", cid[:12], adopted[0][:12], cid[:12])
                 continue
-            our_rw = {source for source, _, rw in ours if rw}
+            if same_jail and self._runtime_adoptable(cid):
+                adopted = (cid, labels)
+                continue
             # A real host path names the conflict better than a <sandbox> token.
-            shared = sorted((s for s, _, rw in theirs if rw and s in our_rw),
-                            key=lambda s: s.startswith(_SANDBOX_TOKEN))
-            if shared and not same_profile:
+            shared = min((s for s, _, rw in theirs if rw and s in our_rw),
+                         key=lambda s: s.startswith(_SANDBOX_TOKEN), default=None)
+            if shared is None:
+                continue
+            if not same_profile:
                 logger.warning(
                     "Running container %s (profile=%r) also bind-mounts %s read-write; profiles sharing "
                     "one jail path are outside the reuse design — starting a separate container",
-                    cid[:12], labels.get("hermes-profile"), shared[0])
-            elif shared and refusal is None:
-                refusal = (cid, labels, shared[0])
+                    cid[:12], labels.get("hermes-profile"), shared)
+            elif refusal is None:
+                refusal = (cid, labels, shared)
         if adopted is not None:
             cid, labels = adopted
             self._container_id = cid
@@ -1115,19 +1109,24 @@ class DockerEnvironment(BaseEnvironment):
                 "container, or spawn under a matching task identity to reuse it.")
         return False
 
-    def _inspect_json(self, container_id: str, template: str):
-        """Decoded ``docker inspect --format <json template>`` output, or ``None`` on any failure."""
+    def _inspect_jail_candidate(self, container_id: str, sandbox_root: str):
+        """``(labels, bind model)`` of a running container from ONE inspect, or ``None`` when the
+        inspect fails or its output is unreadable (the candidate is then skipped)."""
         result = _docker_query(
-            [self._docker_exe, "inspect", "--format", template, container_id], timeout=10,
-            fail="docker inspect %s failed: %s", fail_args=(template,),
-            nonzero="docker inspect %s returned %d: %s")
+            [self._docker_exe, "inspect", "--format",
+             '{"labels":{{json .Config.Labels}},"mounts":{{json .Mounts}}}', container_id], timeout=10,
+            fail="docker inspect mounts failed: %s", nonzero="docker inspect mounts returned %d: %s")
         if result is None:
             return None
         try:
-            return json.loads(result.stdout)
-        except ValueError:
-            logger.debug("docker inspect %s returned malformed JSON for %s", template, container_id[:12])
+            data = json.loads(result.stdout)
+            labels = dict(data["labels"])
+            binds = [(m.get("Source", ""), m.get("Destination", ""), m.get("RW") is True)
+                     for m in data["mounts"] if m.get("Type") == "bind"]
+        except (ValueError, TypeError, KeyError, AttributeError):
+            logger.debug("Mount-conflict probe skipping %s: unreadable inspect output", container_id[:12])
             return None
+        return labels, _bind_model(binds, sandbox_root)
 
     def _runtime_adoptable(self, container_id: str) -> bool:
         """Image and network checks of ``_attach_existing_container``, without its removals: a pinned

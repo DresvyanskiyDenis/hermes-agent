@@ -5,7 +5,7 @@
 # that mount a path under its own temp root. Exit: 0 pass, 1 fail, 77 skip.
 set -u
 cd "$(dirname "$0")/.."
-PY=.venv/bin/python
+PY=${HERMES_PYTHON:-.venv/bin/python}
 export IMAGE=alpine
 
 skip() { echo "SKIP: $*"; exit 77; }
@@ -40,26 +40,21 @@ export HERMES_HOME=$T/home TERMINAL_SANDBOX_DIR=$T/sandboxes
 # and carry no jail identity, which would hide every mount under $T from the guard.
 export TMPDIR=$T/tmp
 
-# Every spawn records its id the moment it exists, so a later crash cannot leak it.
-SPAWN_PY='
+# spawn <task_id> <volume>...: one process per spawn (the cross-process case), printing the
+# container id or "REFUSED <message>". The id is recorded at once so a later crash cannot leak it.
+spawn() {
+  "$PY" -c '
 import os, sys
 from tools.environments.docker import DockerEnvironment
-
-def spawn(task_id, *volumes):
-    env = DockerEnvironment(image=os.environ["IMAGE"], cwd="/", task_id=task_id,
-                            volumes=list(volumes), persistent_filesystem=True)
+try:
+    env = DockerEnvironment(image=os.environ["IMAGE"], cwd="/", task_id=sys.argv[1],
+                            volumes=sys.argv[2:], persistent_filesystem=True)
+except RuntimeError as e:
+    print("REFUSED", e)
+else:
     with open(os.environ["CREATED_IDS"], "a") as f:
         f.write(env._container_id + "\n")
-    print(env._container_id, flush=True)
-'
-
-# spawn <task_id> <volume>...: prints the container id, or "REFUSED <message>".
-spawn() {
-  "$PY" -c "$SPAWN_PY
-try:
-    spawn(*sys.argv[1:])
-except RuntimeError as e:
-    print('REFUSED', e)" "$@"
+    print(env._container_id)' "$@"
 }
 
 # Adoption keeps the short id `docker ps` reports; a fresh `docker run` returns the long one.
@@ -79,15 +74,12 @@ assert_single_jail() {
     n=$(holders "$jail")
     [ "$n" = 1 ] || fail "$n running containers mount $jail (want 1)"
   done
-  [ "$(holders "$B")" = 0 ] || fail "refused spawn left a container on $B"
   echo "PASS single-jail-invariant"
 }
 
 # A: the live leak shape — "default" holds the jail, a "profile:forge" spawn must adopt it.
-out=$("$PY" -c "$SPAWN_PY
-spawn('default', sys.argv[1])
-spawn('profile:forge', sys.argv[1])" "$A:/home/bot") || fail "scenario A spawn crashed: $out"
-id1=$(sed -n 1p <<<"$out") id2=$(sed -n 2p <<<"$out")
+id1=$(spawn default "$A:/home/bot") || fail "scenario A default spawn crashed"
+id2=$(spawn profile:forge "$A:/home/bot") || fail "scenario A forge spawn crashed"
 same_container "$id1" "$id2" || fail "profile:forge got $id2, not the default jail $id1"
 echo "PASS adopt-across-buckets"
 assert_single_jail "$A"
@@ -98,6 +90,7 @@ case "$out" in
   "REFUSED "*"already bind-mounted read-write"*) echo "PASS refuse-on-conflicting-identity" ;;
   *) fail "expected a refusal, got: $out" ;;
 esac
+[ "$(holders "$B")" = 0 ] || fail "refused spawn left a container on $B"
 assert_single_jail "$A"
 
 # C: reverse order in a fresh sandbox root — forge creates first, default must adopt it.
