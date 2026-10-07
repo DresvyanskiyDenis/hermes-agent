@@ -28,10 +28,10 @@ def _jail_candidate(tmp_path, *, profile="bot_1", egress="off", image="python:3.
 
 
 def _mock_jail_guard(monkeypatch, tmp_path, candidates, *, conflict_ps_rc=0, image_available=True,
-                     labeled=None, rm_rc=0):
+                     labeled=None, rm_rc=0, rm_stderr=""):
     """Label-reuse probe misses unless *labeled* (``(cid, state)``) names a by-label hit; the conflict
     probe lists *candidates* (cid -> answers, ``"raw"`` overriding the labels+mounts inspect output).
-    ``docker rm`` exits *rm_rc*. Returns the captured argv list."""
+    ``docker rm`` exits *rm_rc* with *rm_stderr*. Returns the captured argv list."""
     monkeypatch.setenv("TERMINAL_SANDBOX_DIR", str(tmp_path / "sandboxes"))
     # pytest's tmp_path sits under the system tempdir, whose mounts count as volatile and would
     # hide every per-task sandbox dir from the guard; point the process tempdir elsewhere.
@@ -58,7 +58,7 @@ def _mock_jail_guard(monkeypatch, tmp_path, candidates, *, conflict_ps_rc=0, ima
         return result
 
     def _answer(cmd):
-        done = lambda rc=0, out="": subprocess.CompletedProcess(cmd, rc, stdout=out, stderr="")
+        done = lambda rc=0, out="", err="": subprocess.CompletedProcess(cmd, rc, stdout=out, stderr=err)
         sub = cmd[1]
         if sub == "version":
             return done(out="Docker version")
@@ -72,7 +72,7 @@ def _mock_jail_guard(monkeypatch, tmp_path, candidates, *, conflict_ps_rc=0, ima
         if sub == "run":
             return done(out="fresh-cid\n")
         if sub == "rm":
-            return done(rm_rc)
+            return done(rm_rc, err=rm_stderr)
         if sub == "image" and cmd[2] == "inspect":
             return done(0 if image_available else 1, out="sha256:img\n")
         if sub == "pull":
@@ -299,6 +299,27 @@ def test_jail_guard_failed_removal_refuses(monkeypatch, tmp_path):
     assert not _docker_runs(calls)
 
 
+def test_jail_guard_removal_raced_by_another_remover_proceeds(monkeypatch, tmp_path):
+    """A concurrent remover beat our ``docker rm -f``: the container is gone, which is the goal."""
+    calls = _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": _jail_candidate(tmp_path, egress="eg123")},
+                             rm_rc=1, rm_stderr="Error response from daemon: No such container: jail-cid")
+
+    env = _jail_spawn(task_id="default")
+
+    assert env._container_id == "fresh-cid" and _docker_runs(calls)
+
+
+def test_jail_guard_default_spawn_adopts_identical_twin_after_failed_probe(monkeypatch, tmp_path):
+    """No host volumes, so the default twin shares only the sandbox dirs: when the label-reuse
+    probe misses it (timeout, race), the spawn adopts it instead of removing the live shared jail."""
+    calls = _mock_jail_guard(monkeypatch, tmp_path, {"twin-cid": _jail_candidate(tmp_path, jail=None)})
+
+    env = _jail_spawn(task_id="default", volumes=[])
+
+    assert env._container_id == "twin-cid"
+    assert not _docker_runs(calls, "rm", "run")
+
+
 def test_jail_guard_stopped_label_hit_adopts_running_twin(monkeypatch, tmp_path):
     """Daemon restart, forge recovered first: starting the stopped default jail would make two
     running holders of one path. The by-label start is mount-gated and adopts the running twin."""
@@ -338,16 +359,35 @@ def test_jail_guard_drift_replacement_waits_for_refusal(monkeypatch, tmp_path):
     assert not _docker_runs(calls, "rm", "run")
 
 
-def test_jail_guard_recovery_refuses_instead_of_replacing(monkeypatch, tmp_path):
+def test_jail_guard_recovery_refuses_drifted_twin_and_restores_prev(monkeypatch, tmp_path):
     """Exec recovery runs with labels from before the config change: removing the drifted default
     container there would delete the one its successor just recreated, and the two would trade
-    removals. Recovery refuses (and fails the exec) instead."""
+    removals. Recovery refuses (and fails the exec) instead, keeping the gone id so the next exec
+    retries recovery rather than asserting "Container not started"."""
     candidates = {}
     calls = _mock_jail_guard(monkeypatch, tmp_path, candidates)
     env = _jail_spawn(task_id="default")
+    prev_id = env._container_id
     candidates["new-cid"] = _jail_candidate(tmp_path, egress="eg123")
 
     assert env._recreate_container() is False
+    assert env._container_id == prev_id
+    assert not _docker_runs(calls, "rm")
+    assert len(_docker_runs(calls)) == 1
+
+
+def test_jail_guard_recovery_adopts_identical_twin_no_host_volumes(monkeypatch, tmp_path):
+    """Two processes share one profile's default jail with no host volumes; after an out-of-band
+    ``docker rm`` the first recreates it. The second's recovery must adopt that exact-label twin,
+    not refuse it and brick every later exec."""
+    candidates = {}
+    calls = _mock_jail_guard(monkeypatch, tmp_path, candidates)
+    env = _jail_spawn(task_id="default", volumes=[])
+    assert env._container_id == "fresh-cid"
+    candidates["twin-cid"] = _jail_candidate(tmp_path, jail=None)
+
+    assert env._recreate_container() is True
+    assert env._container_id == "twin-cid"
     assert not _docker_runs(calls, "rm")
     assert len(_docker_runs(calls)) == 1
 
@@ -395,6 +435,6 @@ def test_jail_guard_parse_mount_pair_args_joined_flags_and_named_volumes():
 
     assert parse(["--volume=/a:/x", "--mount=type=bind,source=/b,target=/y,ro", "--tmpfs=/root"]) == parse(
         ["--volume", "/a:/x", "--mount", "type=bind,source=/b,target=/y,ro", "--tmpfs", "/root"])
-    assert parse(["-v/a:/x"]) == parse(["-v", "/a:/x"]) == ([("/a", "/x", True)], False)
+    assert parse(["-v/a:/x"]) == parse(["-v=/a:/x"]) == parse(["-v", "/a:/x"]) == ([("/a", "/x", True)], False)
     # ``docker inspect`` lists only binds; a named volume in the spawn's model would never compare equal.
     assert parse(["-v", "named:/x", "-v", "./rel:/y"])[0] == [("./rel", "/y", True)]

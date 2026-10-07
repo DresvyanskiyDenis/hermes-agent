@@ -10,6 +10,8 @@
 #   E: daemon-restart ordering — with the default jail stopped, forge comes up first; the default
 #      spawn's stopped by-label hit must adopt the running forge container, never start beside it.
 #   E2: exec recovery inside a live process restarts its own (adopted, foreign-labeled) container.
+#   F: two envs share one default jail with no host volumes (A-E all carry a real jail bind);
+#      after an out-of-band `docker rm` the first recreates it and the second's recovery adopts it.
 set -u
 cd "$(dirname "$0")/.."
 PY=${HERMES_PYTHON:-.venv/bin/python}
@@ -178,5 +180,35 @@ same_container "$idY" "$before" || fail "E2 env attached $before, not the jail $
 [ "$before" = "$after" ] || fail "recovery switched $before to $after instead of restarting it"
 echo "PASS recovery-restarts-adopted-jail"
 assert_single_jail "$A" "$C" "$E"
+
+# F: the default config (no docker_volumes) mounts only the sandbox dirs. B label-reuses A's jail;
+# after `docker rm` A recovers a fresh one, and B's recovery must adopt that exact-label twin
+# rather than refuse it and leave every later exec asserting "Container not started".
+export TERMINAL_SANDBOX_DIR=$T/sbxF
+out=$("$PY" -c '
+import os, subprocess
+from tools.environments.docker import DockerEnvironment
+kw = dict(image=os.environ["IMAGE"], cwd="/", task_id="default", volumes=[], persistent_filesystem=True)
+a = DockerEnvironment(**kw)
+b = DockerEnvironment(**kw)
+with open(os.environ["CREATED_IDS"], "a") as f:
+    f.write(a._container_id + "\n" + b._container_id + "\n")
+assert a._container_id[:12] == b._container_id[:12], (a._container_id, b._container_id)
+subprocess.run(["docker", "rm", "-f", a._container_id], check=True, capture_output=True)
+ra = a.execute("echo alive")
+rb = b.execute("echo alive")
+with open(os.environ["CREATED_IDS"], "a") as f:
+    f.write(f"{a._container_id}\n{b._container_id}\n")
+print(a._container_id, b._container_id, "alive" in ra.get("output", ""), "alive" in rb.get("output", ""))') \
+  || fail "scenario F crashed: $out"
+read -r idA idB aliveA aliveB <<<"$out"
+[ "$aliveA" = True ] && [ "$aliveB" = True ] || fail "exec after recovery did not run in both envs: $out"
+same_container "$idA" "$idB" || fail "B recovered into $idB, not A's recreated jail $idA: $out"
+n=0
+for id in $(docker ps -q --filter label=hermes-agent=1 --filter status=running); do
+  docker inspect --format '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' "$id" | grep -q "^$T/sbxF" && n=$((n + 1))
+done
+[ "$n" = 1 ] || fail "$n running containers mount $T/sbxF (want 1): $out"
+echo "PASS no-host-volume-default-twin-adopts"
 
 echo "ALL PASS"
