@@ -986,7 +986,7 @@ class DockerEnvironment(BaseEnvironment):
         Network guard is lockdown-only: a bridge container under ``docker_network: false``
         is removed and recreated, but a ``none`` container under default config is kept so
         ``--network=none`` in extra args doesn't churn containers every startup."""
-        existing = self._named_container() or self._find_reusable_container()
+        existing = self._named_container() or self._adopt_legacy_container()
         if existing is None:
             return None
         container_id, state = existing
@@ -1063,7 +1063,7 @@ class DockerEnvironment(BaseEnvironment):
             nonzero="docker ps mount-conflict probe returned %d: %s")
         for cid in result.stdout.split() if result is not None else ():
             holder = self._inspect_container(cid)
-            if holder is None or holder["labels"].get(_ENVIRONMENT_LABEL_KEY) == self._labels[_ENVIRONMENT_LABEL_KEY]:
+            if holder is None or self._is_ours(holder["labels"]):
                 continue
             binds = [(m.get("Source", ""), m.get("Destination", ""), m.get("RW") is True)
                      for m in holder["mounts"] if m.get("Type") == "bind"]
@@ -1162,18 +1162,42 @@ class DockerEnvironment(BaseEnvironment):
             logger.debug("docker inspect %s: unreadable output", ref)
             return None
 
+    def _is_ours(self, labels: dict) -> bool:
+        """Labeled with our fingerprint, or — renamed from before canonical names, labels being
+        immutable — with the legacy one (none under a shared key, whose old containers had none)."""
+        return labels.get(_ENVIRONMENT_LABEL_KEY) in (self._labels[_ENVIRONMENT_LABEL_KEY], self._legacy_fingerprint)
+
     def _named_container(self) -> tuple[str, str] | None:
         """``(id, state)`` of the container holding our name, ``None`` when there is none. The name is
         derived from our fingerprint, so a holder labeled with another one is not ours: refuse."""
         data = self._inspect_container(self._name)
         if data is None:
             return None
-        if (theirs := data["labels"].get(_ENVIRONMENT_LABEL_KEY)) != self._labels[_ENVIRONMENT_LABEL_KEY]:
+        if not self._is_ours(data["labels"]):
+            theirs = data["labels"].get(_ENVIRONMENT_LABEL_KEY)
             raise RuntimeError(
                 f"Refusing to use container {self._name} ({data['id'][:12]}): it is labeled "
                 f"{_ENVIRONMENT_LABEL_KEY}={theirs!r}, not this sandbox's {self._labels[_ENVIRONMENT_LABEL_KEY]!r}. "
                 f"Remove or rename that container (`docker rm -f {self._name}`) and retry.")
         return data["id"], data["state"]
+
+    def _adopt_legacy_container(self) -> tuple[str, str] | None:
+        """``(id, state)`` of a container from before canonical names, found by the labels those
+        processes used, renamed to our name (atomic, running or not) so every later lookup — our
+        recovery, every sibling's spawn — finds it by name. Its labels stay as they are, so
+        label-keyed tooling (orphan reaper, lab wake) still resolves it. A failed rename means a
+        sibling renamed it first: the name holder decides."""
+        legacy = self._find_reusable_container()
+        if legacy is None:
+            return None
+        renamed = _docker_query(
+            [self._docker_exe, "rename", legacy[0], self._name], timeout=10,
+            fail="docker rename %s failed: %s", fail_args=(legacy[0][:12],),
+            nonzero="docker rename %s returned %d: %s")
+        if renamed is None:
+            return self._named_container() or legacy
+        logger.info("Adopted pre-canonical-name container %s as %s", legacy[0][:12], self._name)
+        return legacy
 
     def _ensure_running(self, container_id: str, state: str) -> str:
         """*container_id*, started first unless it is running. A failed start raises: the name is
