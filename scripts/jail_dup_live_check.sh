@@ -27,6 +27,7 @@ docker image inspect "$IMAGE" >/dev/null 2>&1 || docker pull -q "$IMAGE" >/dev/n
   || skip "no daemon/image"
 
 T=$(realpath "$(mktemp -d)")
+GVOL=jaildup_g_$(basename "$T")  # scenario G's named volume, unique to this run
 A=$T/jailA B=$T/jailB C=$T/jailC E=$T/jailE
 mkdir -p "$A" "$B" "$C" "$E" "$T/tmp"
 docker ps -aq --no-trunc --filter label=hermes-agent=1 >"$T/pre.ids"
@@ -40,7 +41,7 @@ cleanup() {
     docker inspect --format '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' "$id" 2>/dev/null \
       | grep -q "^$T/" && docker rm -f "$id" >/dev/null
   done <"$CREATED_IDS"
-  docker volume rm jaildup_g_vol >/dev/null 2>&1
+  docker volume rm "$GVOL" >/dev/null 2>&1
   # The containers ran as root and wrote into their bind-mounted sandbox dirs.
   rm -rf "$T" 2>/dev/null || { docker run --rm -v "$T:/t" "$IMAGE" find /t -mindepth 1 -delete; rm -rf "$T"; }
   exit "$rc"
@@ -210,10 +211,10 @@ assert_single_jail "$T/sbxF/docker/default/home" "$T/sbxF/docker/default/workspa
 # G: A-F differ only in binds. A named volume is invisible to the bind model, so only the
 # environment fingerprint tells this default twin is stale: adopting it would drop the volume.
 export TERMINAL_SANDBOX_DIR=$T/sbxG
-idC=$(spawn default) || fail "scenario G default spawn crashed"
-idG=$(spawn default jaildup_g_vol:/data) || fail "scenario G drifted spawn crashed: $idG"
-[ "${#idG}" = 64 ] && [ "$idG" != "$idC" ] || fail "drifted default must replace $idC with a fresh container, got: $idG"
-[ "$(docker inspect --format '{{.State.Running}}' "$idC" 2>/dev/null)" = true ] && fail "stale default $idC still running"
+idOld=$(spawn default) || fail "scenario G default spawn crashed"
+idG=$(spawn default "$GVOL:/data") || fail "scenario G drifted spawn crashed: $idG"
+[ "${#idG}" = 64 ] && [ "$idG" != "$idOld" ] || fail "drifted default must replace $idOld with a fresh container, got: $idG"
+[ "$(docker inspect --format '{{.State.Running}}' "$idOld" 2>/dev/null)" = true ] && fail "stale default $idOld still running"
 docker inspect --format '{{range .Mounts}}{{.Type}}:{{.Destination}}{{"\n"}}{{end}}' "$idG" | grep -qx volume:/data \
   || fail "replacement $idG does not carry the named volume"
 echo "PASS default-fingerprint-drift-replaces"

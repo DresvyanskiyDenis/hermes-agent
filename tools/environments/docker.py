@@ -705,11 +705,11 @@ def _classify_jail_candidate(our_labels, ours, has_tmpfs, labels, theirs) -> tup
 
     ``same_jail``: adoptable modulo runtime — same profile, one side the ``default`` bucket, equal
     binds with a colliding RW path (for a default twin with no host volumes, only the sandbox dirs),
-    same egress, no tmpfs spawn. Default↔default also needs an equal ``hermes-environment``
-    fingerprint: it covers what the bind model cannot see (named volumes, mount options,
-    hermes_home), and an absent label never matches a present one. Across buckets it is ignored —
-    the hash embeds the per-task sandbox paths, so it can never be equal. ``verdict`` is the outcome
-    when it is NOT adopted, ``path`` the colliding RW source to name (a real one when any):
+    same egress, no tmpfs spawn, and for default↔default an equal ``hermes-environment`` label (it
+    covers what the bind model cannot see: named volumes, mount options, hermes_home; an absent
+    label never matches a present one). Across buckets that label is ignored: the hash embeds the
+    per-task sandbox paths. ``verdict`` is the outcome when NOT adopted, ``path`` the colliding RW
+    source to name (a real one when any):
 
     - ``"replace"``: default↔default with equal binds — config evolution (egress/image/network/
       environment fingerprint).
@@ -733,11 +733,10 @@ def _classify_jail_candidate(our_labels, ours, has_tmpfs, labels, theirs) -> tup
     path = min(real_shared or colliding)
     jail_side = same_profile and (our_default or their_default)
     same_jail = (jail_side and theirs == ours and not has_tmpfs
-                 and labels.get(_EGRESS_LABEL_KEY) == our_labels[_EGRESS_LABEL_KEY]
-                 and (not both_default
-                      or labels.get(_ENVIRONMENT_LABEL_KEY) == our_labels.get(_ENVIRONMENT_LABEL_KEY)))
+                 and labels.get(_EGRESS_LABEL_KEY) == our_labels[_EGRESS_LABEL_KEY])
     if both_default and theirs == ours:
-        return same_jail, "replace", path
+        same_env = labels.get(_ENVIRONMENT_LABEL_KEY) == our_labels.get(_ENVIRONMENT_LABEL_KEY)
+        return same_jail and same_env, "replace", path
     if jail_side and any(s.startswith(_SANDBOX_TOKEN) for s, _, _ in theirs):
         return same_jail, "refuse", path
     return same_jail, "warn", path
@@ -1115,14 +1114,13 @@ class DockerEnvironment(BaseEnvironment):
           either side is the ``default`` bucket: forge spawn vs default jail, the reverse, or a
           default twin with no host volumes that another process of the profile recreated. An image
           mismatch never adopts across buckets — a per-task image override must not run inside the
-          user's jail. Within one bucket (default↔default) the ``hermes-environment`` fingerprint
-          must match too: drift the bind model cannot see (a named volume, a mount option,
-          hermes_home) falls through to REPLACE. Across buckets it stays ignored — the hash embeds
-          the per-task sandbox paths.
+          user's jail. Default↔default also needs an equal ``hermes-environment`` fingerprint, so
+          drift the bind model cannot see (a named volume) replaces; across buckets it is ignored.
         - REPLACE (``docker rm -f``, then a fresh ``docker run``) a ``default`` container when ours
           is ``default`` too and its binds equal ours but it is not adoptable: genuine config
-          evolution (egress, pinned image, network, environment fingerprint). Replace requires bind-model equality; a mount
-          divergence refuses instead, since the sibling may hold a live sandbox. Before any removal
+          evolution (egress, pinned image, network, environment fingerprint). Replace requires
+          bind-model equality; a mount divergence refuses instead, since the sibling may hold a live
+          sandbox. Before any removal
           the image policy runs: an unpinned default-image flip, or a replacement image that cannot
           be pulled, keeps the existing container — but only for pure image drift (same egress and
           network); any other drift refuses rather than attach a foreign posture. A failed removal
@@ -1138,15 +1136,14 @@ class DockerEnvironment(BaseEnvironment):
 
         Probe-then-run is not atomic: this prevents or self-heals the sequential mis-spawn class
         (spawn/restart under a differing task bucket); simultaneous cold races remain possible and
-        each bucket keeps its own container until a restart re-runs the gate. In that class: two
-        processes replacing one drifted default twin can both pass the removal and both ``docker
-        run``, leaving two default containers on the same sandbox dirs (the next gate run adopts
-        one and warns about the other). "Restart" means a daemon/container restart: a Hermes
-        process restart attaches to a running by-label hit without re-running the gate, so the
-        duplicate survives it. *exclude* (exec
-        recovery's previous container) is never adopted or refused. A tmpfs /root cannot be proven
-        equivalent to a bound one, so a tmpfs spawn never adopts. A read-only side never conflicts.
-        Probe failures proceed — this must never brick startup."""
+        each bucket keeps its own container until a daemon/container restart re-runs the gate — a
+        Hermes process restart attaches to a running by-label hit without it, so the duplicate
+        survives that. Likewise two processes replacing one drifted default twin can both remove
+        it and both ``docker run``: two default containers on one bucket's sandbox dirs (the next
+        gate run adopts one and warns about the other). *exclude* (exec recovery's previous
+        container) is never adopted or refused. A tmpfs /root cannot be proven equivalent to a
+        bound one, so a tmpfs spawn never adopts. A read-only side never conflicts. Probe failures
+        proceed — this must never brick startup."""
         if not self._persist_across_processes:
             return False
         root = _persistent_sandbox_root()

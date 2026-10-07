@@ -32,7 +32,7 @@ def _jail_candidate(tmp_path, *, profile="bot_1", egress="off", image="python:3.
     # The fingerprint the matching spawn stamps: its sandbox binds, then its volumes, in argv order.
     fingerprint = docker_env._reuse_environment_fingerprint(
         image=image, mount_args=[arg for s, d in binds for arg in ("-v", f"{s}:{d}")],
-        hermes_home=str(tmp_path / "hermes-home"))
+        hermes_home=str(docker_env.get_hermes_home()))
     return {
         "labels": {"hermes-agent": "1", "hermes-profile": profile, "hermes-task-id": task,
                    "hermes-egress": egress, "hermes-environment": fingerprint},
@@ -47,7 +47,8 @@ def _mock_jail_guard(monkeypatch, tmp_path, candidates, *, conflict_ps_rc=0, ima
     ``docker rm`` exits *rm_rc* with *rm_stderr*; every ``docker exec`` finds its container gone.
     Returns the captured argv list."""
     monkeypatch.setenv("TERMINAL_SANDBOX_DIR", str(tmp_path / "sandboxes"))
-    monkeypatch.setattr(docker_env, "get_hermes_home", lambda: tmp_path / "hermes-home")
+    # The snapshot bootstrap only execs into the container; nothing here depends on it.
+    monkeypatch.setattr(docker_env.DockerEnvironment, "init_session", lambda self: None)
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "bot_1")
     monkeypatch.setattr(docker_env, "_readonly_skill_mount_args", lambda: [])
@@ -271,31 +272,19 @@ def test_jail_guard_default_spawn_adopts_forge_jail(monkeypatch, tmp_path):
 @pytest.mark.parametrize("candidate_kw, spawn_kw", [
     ({"egress": "eg123"}, {}),
     ({"image": "other:tag"}, {"image_pinned": True}),
-], ids=["egress-change", "pinned-image-change"])
+    # Invisible to the bind model: only the environment fingerprint tells the twin is stale.
+    ({"jail": None}, {"volumes": ["cache:/data"]}),
+    ({}, {"volumes": ["/srv/jail:/home/bot:z"]}),
+], ids=["egress-change", "pinned-image-change", "named-volume", "mount-option"])
 def test_jail_guard_default_config_drift_replaces(monkeypatch, tmp_path, candidate_kw, spawn_kw):
-    """``hermes egress enable`` / a re-pinned image on a live profile: the stale default container
-    is removed and recreated, as label reuse does, instead of wedging every terminal call."""
+    """``hermes egress enable`` / a re-pinned image / an added named volume on a live profile: the
+    stale default container is removed and recreated, as label reuse does, instead of being
+    adopted (silently dropping the new config) or wedging every terminal call."""
     calls = _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": _jail_candidate(tmp_path, **candidate_kw)})
 
     env = _jail_spawn(task_id="default", **spawn_kw)
 
     assert ["/usr/bin/docker", "rm", "-f", "jail-cid"] in calls
-    assert env._container_id == "fresh-cid" and _docker_runs(calls)
-
-
-@pytest.mark.parametrize("candidate_kw, volumes", [
-    ({"jail": None}, ["cache:/data"]),
-    ({}, ["/srv/jail:/home/bot:z"]),
-], ids=["named-volume", "mount-option"])
-def test_jail_guard_default_twin_fingerprint_drift_replaces(monkeypatch, tmp_path, candidate_kw, volumes):
-    """A named volume or mount option is invisible to the bind model, so the stale default twin is
-    bind- and egress-equal; only its environment fingerprint differs. Adopting it would silently
-    drop the new config, so it is replaced."""
-    calls = _mock_jail_guard(monkeypatch, tmp_path, {"twin-cid": _jail_candidate(tmp_path, **candidate_kw)})
-
-    env = _jail_spawn(task_id="default", volumes=volumes)
-
-    assert ["/usr/bin/docker", "rm", "-f", "twin-cid"] in calls
     assert env._container_id == "fresh-cid" and _docker_runs(calls)
 
 
@@ -435,14 +424,13 @@ def test_jail_guard_refused_recovery_retries_on_next_exec(monkeypatch, tmp_path)
     env = _jail_spawn(task_id="default", volumes=["cache:/data"])
     prev_id = env._container_id
     candidates["twin-cid"] = _jail_candidate(tmp_path, jail=None)
-    conflict_probes = lambda: len([c for c in calls if c[1] == "ps" and "status=running" in c])
-    before = conflict_probes()
+    calls.clear()
 
     env.execute("true")
-    assert conflict_probes() == before + 1
+    assert len(_docker_runs(calls, "ps")) == 1
     result = env.execute("true")
 
-    assert conflict_probes() == before + 2
+    assert len(_docker_runs(calls, "ps")) == 2
     assert env._container_id == prev_id and result["returncode"] != 0
 
 
