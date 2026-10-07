@@ -1196,7 +1196,7 @@ def test_failed_docker_run_cleans_up_orphaned_container(monkeypatch):
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
 
-    cleanup_calls = []
+    cleanup_calls, run_names = [], []
 
     def _run(cmd, **kwargs):
         if isinstance(cmd, list) and len(cmd) >= 2:
@@ -1207,6 +1207,7 @@ def test_failed_docker_run_cleans_up_orphaned_container(monkeypatch):
                 # No reusable container -> fall through to a fresh `docker run`.
                 return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
             if sub == "run":
+                run_names.append(cmd[cmd.index("--name") + 1])
                 raise subprocess.CalledProcessError(
                     125, cmd, output="", stderr="docker: Error response from daemon"
                 )
@@ -1221,9 +1222,9 @@ def test_failed_docker_run_cleans_up_orphaned_container(monkeypatch):
         _make_dummy_env()
 
     assert len(cleanup_calls) == 1, "docker rm should be called once for the orphaned container"
-    rm_cmd = cleanup_calls[0]
-    assert rm_cmd[1] == "rm" and rm_cmd[2] == "-f"
-    assert rm_cmd[3].startswith("hermes-"), "should remove the container by its generated name"
+    # Plain rm by the canonical name: the daemon refuses it if a sibling's running container holds it.
+    assert re.fullmatch(r"hermes-[0-9a-f]{12}", run_names[0])
+    assert cleanup_calls[0] == ["/usr/bin/docker", "rm", run_names[0]]
 
 
 def test_docker_run_timeout_cleans_up_orphaned_container(monkeypatch):
@@ -1234,7 +1235,7 @@ def test_docker_run_timeout_cleans_up_orphaned_container(monkeypatch):
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
 
-    cleanup_calls = []
+    cleanup_calls, run_names = [], []
 
     def _run(cmd, **kwargs):
         if isinstance(cmd, list) and len(cmd) >= 2:
@@ -1244,6 +1245,7 @@ def test_docker_run_timeout_cleans_up_orphaned_container(monkeypatch):
             if sub == "ps":
                 return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
             if sub == "run":
+                run_names.append(cmd[cmd.index("--name") + 1])
                 raise subprocess.TimeoutExpired(cmd, 120)
             if sub == "rm":
                 cleanup_calls.append(list(cmd))
@@ -1256,9 +1258,9 @@ def test_docker_run_timeout_cleans_up_orphaned_container(monkeypatch):
         _make_dummy_env()
 
     assert len(cleanup_calls) == 1, "docker rm should be called once for the orphaned container"
-    rm_cmd = cleanup_calls[0]
-    assert rm_cmd[1] == "rm" and rm_cmd[2] == "-f"
-    assert rm_cmd[3].startswith("hermes-"), "should remove the container by its generated name"
+    # Plain rm by the canonical name: the daemon refuses it if a sibling's running container holds it.
+    assert re.fullmatch(r"hermes-[0-9a-f]{12}", run_names[0])
+    assert cleanup_calls[0] == ["/usr/bin/docker", "rm", run_names[0]]
 
 
 

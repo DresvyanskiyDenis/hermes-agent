@@ -1345,24 +1345,70 @@ class DockerEnvironment(BaseEnvironment):
             "sleep", "infinity"]
 
     def _docker_run(self, cwd: str) -> str:
-        """Start a fresh container and return its id. A failed ``docker run`` (exit 125, timeout
-        mid-pull) can leave a "Created" orphan the exited-only reaper never catches, so it is
-        removed by name before re-raising."""
-        container_name = self._name
-        run_cmd = self._run_command(container_name, cwd)
+        """Start our container under its name and return its id. The name is the atomic duplicate
+        test: a sibling process with the same configuration that won the race makes ``docker run``
+        fail "already in use", and its container is then ours too. Any other failure (exit 125,
+        timeout mid-pull) can leave a "Created" orphan the exited-only reaper never catches, so it is
+        removed by name before re-raising — with a plain ``rm``: the daemon refuses that on a running
+        container, which the name may by now be held by."""
+        run_cmd = self._run_command(self._name, cwd)
         logger.debug("Starting container: %s", ' '.join(run_cmd))
         try:
             result = run_capture(
                 run_cmd, timeout=120, check=True,  # image pull may take a while
                 env=self._docker_client_env(self._run_env_values))
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            logger.warning("docker run failed for %s, cleaning up orphaned container: %s", container_name, e)
+            if "already in use" in (getattr(e, "stderr", None) or "") and (holder := self._named_container()):
+                logger.info("Container name %s was taken by a sibling process — attaching to %s",
+                            self._name, holder[0][:12])
+                return self._ensure_running(*holder)
+            logger.warning("docker run failed for %s, cleaning up orphaned container: %s", self._name, e)
             subprocess.run(
-                [self._docker_exe, "rm", "-f", container_name],
+                [self._docker_exe, "rm", self._name],
                 capture_output=True, timeout=10, stdin=subprocess.DEVNULL)
             raise
         container_id = result.stdout.strip()
-        logger.info("Started container %s (%s)", container_name, container_id[:12])
+        logger.info("Started container %s (%s)", self._name, container_id[:12])
+        return container_id
+
+    def _inspect_container(self, ref: str) -> dict | None:
+        """``{"id", "state", "labels", "mounts"}`` of container *ref* (name or id) from ONE inspect, or
+        ``None`` when there is no such container or the inspect fails or is unreadable."""
+        result = _docker_query(
+            [self._docker_exe, "inspect", "--type", "container", "--format",
+             '{"id":{{json .Id}},"state":{{json .State.Status}},"labels":{{json .Config.Labels}},'
+             '"mounts":{{json .Mounts}}}', ref], timeout=10,
+            fail="docker inspect %s failed: %s", fail_args=(ref,), nonzero="docker inspect %s returned %d: %s")
+        if result is None:
+            return None
+        try:
+            data = json.loads(result.stdout)
+            return {"id": data["id"], "state": data["state"], "labels": dict(data["labels"] or {}),
+                    "mounts": list(data["mounts"] or [])}
+        except (ValueError, TypeError, KeyError):
+            logger.debug("docker inspect %s: unreadable output", ref)
+            return None
+
+    def _named_container(self) -> tuple[str, str] | None:
+        """``(id, state)`` of the container holding our name, ``None`` when there is none. The name is
+        derived from our fingerprint, so a holder labeled with another one is not ours: refuse."""
+        data = self._inspect_container(self._name)
+        if data is None:
+            return None
+        if (theirs := data["labels"].get(_ENVIRONMENT_LABEL_KEY)) != self._labels[_ENVIRONMENT_LABEL_KEY]:
+            raise RuntimeError(
+                f"Refusing to use container {self._name} ({data['id'][:12]}): it is labeled "
+                f"{_ENVIRONMENT_LABEL_KEY}={theirs!r}, not this sandbox's {self._labels[_ENVIRONMENT_LABEL_KEY]!r}. "
+                f"Remove or rename that container (`docker rm -f {self._name}`) and retry.")
+        return data["id"], data["state"]
+
+    def _ensure_running(self, container_id: str, state: str) -> str:
+        """*container_id*, started first unless it is running. A failed start raises: the name is
+        taken, so there is no fresh container to fall back to."""
+        if state != "running" and (err := self._start_container(container_id)) is not None:
+            raise RuntimeError(
+                f"Could not start sandbox container {self._name} ({container_id[:12]}, state={state}): "
+                f"{(getattr(err, 'stderr', None) or '').strip() or err}") from err
         return container_id
 
     # --- Env forwarding ---
