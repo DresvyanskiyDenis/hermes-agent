@@ -648,12 +648,12 @@ def _canonical_bind_source(path: str, sandbox_root: str) -> str:
 
 
 def _split_joined_mount_flags(run_args: list[str]):
-    """``--volume=x``, ``--mount=x``, ``--tmpfs=x`` and ``-vx`` as separate flag and value tokens."""
+    """``--volume=x``, ``--mount=x``, ``--tmpfs=x``, ``-vx`` and ``-v=x`` as separate flag and value tokens."""
     for arg in run_args:
         if arg.startswith(("--volume=", "--mount=", "--tmpfs=")):
             yield from arg.split("=", 1)
         elif arg.startswith("-v") and len(arg) > 2 and arg[2] != "-":
-            yield from ("-v", arg[2:])
+            yield from ("-v", arg[2:].removeprefix("="))
         else:
             yield arg
 
@@ -704,7 +704,8 @@ def _classify_jail_candidate(our_labels, ours, has_tmpfs, labels, theirs) -> tup
     and canonical bind models alone (runtime image/network checks are the caller's).
 
     ``same_jail``: adoptable modulo runtime — same profile, one side the ``default`` bucket, equal
-    binds that include a real shared RW path, same egress, no tmpfs spawn. ``verdict`` is the outcome
+    binds that either share a real RW path or are both the default bucket (an exact-label twin with
+    no host volumes mounts only the sandbox dirs), same egress, no tmpfs spawn. ``verdict`` is the outcome
     when it is NOT adopted, ``path`` the colliding RW source to name (a real one when any):
 
     - ``"replace"``: default↔default with equal binds — config evolution (egress/image/network).
@@ -727,7 +728,7 @@ def _classify_jail_candidate(our_labels, ours, has_tmpfs, labels, theirs) -> tup
         return False, None, None
     path = min(real_shared or colliding)
     jail_side = same_profile and (our_default or their_default)
-    same_jail = (jail_side and bool(real_shared) and theirs == ours and not has_tmpfs
+    same_jail = (jail_side and (bool(real_shared) or both_default) and theirs == ours and not has_tmpfs
                  and labels.get(_EGRESS_LABEL_KEY) == our_labels[_EGRESS_LABEL_KEY])
     if both_default and theirs == ours:
         return same_jail, "replace", path
@@ -1092,7 +1093,7 @@ class DockerEnvironment(BaseEnvironment):
             container_id[:12], task_label, profile_name, state)
         return True
 
-    def _adopt_or_refuse_mount_conflict(self, replace: bool = True) -> bool:
+    def _adopt_or_refuse_mount_conflict(self, replace: bool = True, exclude: str | None = None) -> bool:
         """Mount gate for every spawn that misses label reuse and every ``docker start`` of a hermes
         container (stopped by-label attach, exec recovery). What is forbidden is double-mounting the
         same host path RW under conflicting sandbox identity; same-profile containers whose only
@@ -1104,9 +1105,10 @@ class DockerEnvironment(BaseEnvironment):
         Per running candidate (``_classify_jail_candidate``), in order:
 
         - ADOPT a same-profile, same-egress container whose binds equal ours modulo the sandbox
-          bucket and include a real shared RW path, with the exact same image and a compatible
-          network, when either side is the ``default`` bucket: forge spawn vs default jail, or the
-          reverse. An image mismatch never adopts across buckets — a per-task image override must
+          bucket and either share a real RW path or are both the default bucket, with the exact same
+          image and a compatible network, when either side is the ``default`` bucket: forge spawn vs
+          default jail, the reverse, or a default twin with no host volumes (another process of the
+          profile recreated the shared default jail). An image mismatch never adopts across buckets — a per-task image override must
           not run inside the user's jail.
         - REPLACE (``docker rm -f``, then a fresh ``docker run``) a ``default`` container when ours
           is ``default`` too and its binds equal ours but it is not adoptable: genuine config
@@ -1125,9 +1127,10 @@ class DockerEnvironment(BaseEnvironment):
           on one path: outside the reuse design, and refusing would break shared estate paths).
         - Otherwise PROCEED (``False``): rollout:one vs rollout:two sharing only per-task dirs.
 
-        Probe-then-run is not atomic: this prevents or self-heals the duplicate-jail class
+        Probe-then-run is not atomic: this prevents or self-heals the sequential mis-spawn class
         (spawn/restart under a differing task bucket); simultaneous cold races remain possible and
-        converge on the next adopt. A tmpfs /root cannot be proven equivalent to a bound one, so a
+        each bucket keeps its own container until a restart re-runs the gate. *exclude* is never
+        adopted or refused (exec recovery's own previous container). A tmpfs /root cannot be proven equivalent to a bound one, so a
         tmpfs spawn never adopts. A read-only side never conflicts. Probe failures proceed — this
         must never brick startup."""
         if not self._persist_across_processes:
@@ -1145,8 +1148,7 @@ class DockerEnvironment(BaseEnvironment):
         adopted = refusal = None
         replaceable: list[tuple[str, dict, str]] = []
         for cid in result.stdout.split():
-            # Callers probe before setting _container_id; never adopt or refuse our own container.
-            if cid == self._container_id:
+            if cid == exclude:
                 continue
             candidate = self._inspect_jail_candidate(cid, root)
             if candidate is None:
@@ -1227,6 +1229,10 @@ class DockerEnvironment(BaseEnvironment):
             try:
                 run_capture([self._docker_exe, "rm", "-f", cid], timeout=30, check=True)
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
+                # A concurrent remover got there first: the container is gone, which is the goal.
+                if isinstance(e, subprocess.CalledProcessError) and "No such container" in (e.stderr or ""):
+                    logger.debug("Stale container %s was already removed by another process", cid[:12])
+                    continue
                 raise RuntimeError(
                     f"Could not remove stale sandbox container {cid[:12]} to replace it "
                     f"({(getattr(e, 'stderr', None) or '').strip() or e}); refusing to start a duplicate "
@@ -1410,9 +1416,12 @@ class DockerEnvironment(BaseEnvironment):
         logger.warning("Container %s appears to be gone — attempting recovery", (prev or "")[:12])
         self._container_id = None
         try:
-            recovered = self._adopt_or_refuse_mount_conflict(replace=False)
+            recovered = self._adopt_or_refuse_mount_conflict(replace=False, exclude=prev)
         except RuntimeError as e:
-            logger.error("Recovery refused: %s", e)
+            # Keep the gone id: later execs fail as container-gone and retry recovery, where a
+            # None id would assert "Container not started" forever.
+            self._container_id = prev
+            logger.error("Recovery refused (retried on the next exec): %s", e)
             return False
         recovered = recovered or (bool(prev) and self._claim_for_recovery(prev, "exited"))
         if not recovered and (existing := self._find_reusable_container(

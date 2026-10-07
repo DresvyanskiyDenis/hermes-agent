@@ -38,7 +38,7 @@ def test_docker_recovery_marks_pending_and_finalizer_warns(monkeypatch):
     # is about the recreation notice, so both probes are stubbed to "nothing found / gone".
     monkeypatch.setattr(
         docker_env.DockerEnvironment, "_adopt_or_refuse_mount_conflict",
-        lambda self, replace=True: False)
+        lambda self, replace=True, exclude=None: False)
     monkeypatch.setattr(
         docker_env.DockerEnvironment, "_start_container",
         lambda self, cid: RuntimeError("No such container"))
