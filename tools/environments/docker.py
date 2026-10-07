@@ -1135,15 +1135,37 @@ class DockerEnvironment(BaseEnvironment):
                 f"(task={labels.get('hermes-task-id')!r}, profile={labels.get('hermes-profile')!r}) with a "
                 "conflicting sandbox identity (egress/image/network/mounts). Stop or remove that "
                 "container, or spawn under a matching task identity to reuse it.")
-        for cid in replaceable:
-            logger.warning(
-                "Running default container %s shares this profile's jail mounts but its sandbox "
-                "configuration (egress/image/network/mounts) changed — removing it and starting "
-                "fresh (profile=%s)", cid[:12], self._labels["hermes-profile"])
-            try:
-                run_capture([self._docker_exe, "rm", "-f", cid], timeout=30)
-            except (subprocess.TimeoutExpired, OSError) as e:
-                logger.warning("Failed to remove mismatched container %s: %s", cid[:12], e)
+        if replaceable:
+            # _attach_existing_container's image policy applies before any removal: an unpinned
+            # default-image flip keeps the existing sandbox (its state matters more than the tag),
+            # and a replacement image that cannot be pulled must not cost the profile its only
+            # sandbox — removing first would throw away the writable layer for nothing.
+            first = replaceable[0]
+            actual_image = self._container_image(first)
+            if (actual_image is not None and actual_image != self._image and not self._image_pinned):
+                logger.warning(
+                    "Container %s carries stale sandbox configuration for image %s, but the default "
+                    "docker_image is not pinned — keeping the existing sandbox until it is (profile=%s)",
+                    first[:12], self._image, self._labels["hermes-profile"])
+                self._container_id = first
+                return True
+            if not self._image_available_locally():
+                cid = replaceable[0]
+                logger.warning(
+                    "Container %s carries stale sandbox configuration but image %s could not be "
+                    "pulled — keeping and reusing it until the replacement can start (profile=%s)",
+                    cid[:12], self._image, self._labels["hermes-profile"])
+                self._container_id = cid
+                return True
+            for cid in replaceable:
+                logger.warning(
+                    "Running default container %s shares this profile's jail mounts but its sandbox "
+                    "configuration (egress/image/network/mounts) changed — removing it and starting "
+                    "fresh (profile=%s)", cid[:12], self._labels["hermes-profile"])
+                try:
+                    run_capture([self._docker_exe, "rm", "-f", cid], timeout=30)
+                except (subprocess.TimeoutExpired, OSError) as e:
+                    logger.warning("Failed to remove mismatched container %s: %s", cid[:12], e)
         return False
 
     def _inspect_jail_candidate(self, container_id: str, sandbox_root: str):

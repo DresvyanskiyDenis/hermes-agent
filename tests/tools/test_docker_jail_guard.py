@@ -27,7 +27,7 @@ def _jail_candidate(tmp_path, *, profile="bot_1", egress="off", image="python:3.
         "image": image, "net": net}
 
 
-def _mock_jail_guard(monkeypatch, tmp_path, candidates, *, conflict_ps_rc=0):
+def _mock_jail_guard(monkeypatch, tmp_path, candidates, *, conflict_ps_rc=0, image_available=True):
     """Label-reuse probe always misses; the conflict probe lists *candidates* (cid -> answers,
     ``"raw"`` overriding the labels+mounts inspect output). Returns the captured argv list."""
     monkeypatch.setenv("TERMINAL_SANDBOX_DIR", str(tmp_path / "sandboxes"))
@@ -63,6 +63,10 @@ def _mock_jail_guard(monkeypatch, tmp_path, candidates, *, conflict_ps_rc=0):
             return done(out=_inspect(candidates[cmd[-1]], cmd[cmd.index("--format") + 1]))
         if sub == "run":
             return done(out="fresh-cid\n")
+        if sub == "image" and cmd[2] == "inspect":
+            return done(0 if image_available else 1, out="sha256:img\n")
+        if sub == "pull":
+            return done(0 if image_available else 1)
         return done()
 
     monkeypatch.setattr(docker_env.subprocess, "run", _run)
@@ -219,6 +223,21 @@ def test_jail_guard_default_config_drift_replaces(monkeypatch, tmp_path, candida
 
     assert ["/usr/bin/docker", "rm", "-f", "jail-cid"] in calls
     assert env._container_id == "fresh-cid" and _docker_runs(calls)
+
+
+def test_jail_guard_drift_keeps_old_container_when_image_unavailable(monkeypatch, tmp_path):
+    """A replacement image that cannot be pulled must not cost the profile its only sandbox:
+    the stale-but-working container is kept and attached, mirroring _attach_existing_container's
+    pinned-image branch (removing first would throw away its writable layer for nothing)."""
+    calls = _mock_jail_guard(monkeypatch, tmp_path,
+                             {"jail-cid": _jail_candidate(tmp_path, egress="eg123")},
+                             image_available=False)
+
+    env = _jail_spawn(task_id="default")
+
+    assert not [c for c in calls if c[1] == "rm"], "a stale container stays while its replacement cannot be pulled"
+    assert not _docker_runs(calls)
+    assert env._container_id == "jail-cid"
 
 
 def test_jail_guard_drift_replacement_waits_for_refusal(monkeypatch, tmp_path):
