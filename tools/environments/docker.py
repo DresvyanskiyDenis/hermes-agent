@@ -802,11 +802,10 @@ class DockerEnvironment(BaseEnvironment):
             + egress_host_args + volume_args + env_args + validated_extra)
         logger.info("Docker run_args: %s", all_run_args)
 
-        # Labels identify hermes containers to the orphan reaper (hermes-agent=1),
-        # cross-process reuse (task-id/profile) and operators. The reuse identity
-        # is captured at start and never changes for the container's lifetime.
-        # Egress posture gets its own label: env/CA mounts are immutable after
-        # creation, so reusing a pre-egress container would bypass the firewall.
+        # Labels identify hermes containers to the orphan reaper (hermes-agent=1, profile)
+        # and operators; the fingerprint label carries the identity the container name is
+        # derived from, captured at start and never changed for the container's lifetime.
+        # Egress posture is a fingerprint input and also its own label for operators.
         profile_name = _container_identity(shared_container_key)
         task_label = _sanitize_label_value(task_id)
         self._labels = {

@@ -800,8 +800,9 @@ def test_labels_attribute_populated_after_init(monkeypatch):
 
 
 @pytest.mark.parametrize("changed_setting", ["image", "volumes", "hermes_home"])
-def test_reuse_probe_filters_on_environment_fingerprint(monkeypatch, tmp_path, changed_setting):
-    """Reuse and recovery must select the requested configuration, not stale mounts."""
+def test_container_name_follows_environment_fingerprint(monkeypatch, tmp_path, changed_setting):
+    """Lookup and spawn both go through the fingerprint-derived name, so a changed configuration
+    selects a different container instead of reusing one with stale mounts."""
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "alpha"))
@@ -810,19 +811,16 @@ def test_reuse_probe_filters_on_environment_fingerprint(monkeypatch, tmp_path, c
         (tmp_path / name / "skills").mkdir(parents=True)
     calls = _mock_subprocess_run(monkeypatch)
 
-    def reuse_filters():
-        return tuple(
-            arg for cmd, _ in calls if isinstance(cmd, list) and cmd[1:3] == ["ps", "-a"]
-            for arg in cmd if arg.startswith("label=")
-        )
+    def used_names():
+        looked_up = {cmd[-1] for cmd, _ in calls if isinstance(cmd, list) and cmd[1:4] == ["inspect", "--type", "container"]}
+        spawned = {cmd[cmd.index("--name") + 1] for cmd, _ in calls if isinstance(cmd, list) and cmd[1] == "run"}
+        return looked_up, spawned
 
     config = {"image": "python:3.11", "volumes": ["volume-a:/workspace"]}
-    _make_dummy_env(**config)
-    original_filters = reuse_filters()
-    assert original_filters
+    original = _make_dummy_env(**config)
+    assert used_names() == ({original._name}, {original._name})
     calls.clear()
-    _make_dummy_env(**config)
-    assert reuse_filters() == original_filters
+    assert _make_dummy_env(**config)._name == original._name
 
     if changed_setting == "hermes_home":
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "beta"))
@@ -830,16 +828,12 @@ def test_reuse_probe_filters_on_environment_fingerprint(monkeypatch, tmp_path, c
         config[changed_setting] = {"image": "python:3.12", "volumes": ["volume-b:/workspace"]}[changed_setting]
     calls.clear()
     env = _make_dummy_env(**config)
-    changed_filters = reuse_filters()
-    assert changed_filters != original_filters
-    assert f"label=hermes-environment={env._labels['hermes-environment']}" in changed_filters
-    assert set(f.removeprefix("label=") for f in changed_filters) <= _labels_in_run_args(_run_args_from_calls(calls))
+    assert env._name != original._name
+    assert used_names() == ({env._name}, {env._name})
 
     calls.clear()
-    # Recovery restarts its own container first; label reuse runs once that one is gone.
-    monkeypatch.setattr(env, "_start_container", lambda cid: RuntimeError("No such container"))
     assert env._recreate_container()
-    assert reuse_filters() == changed_filters
+    assert used_names() == ({env._name}, {env._name})
 
 
 def test_shared_container_key_replaces_profile_identity(monkeypatch, tmp_path):
