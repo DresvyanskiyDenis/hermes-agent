@@ -1,23 +1,25 @@
 #!/usr/bin/env bash
-# Live-daemon repro for duplicate jail mounts (t_44fdd37a). Touches only containers it created
-# that mount a path under its own temp root. Exit: 0 pass, 1 fail, 77 skip.
-#   A: a spawn under another task bucket adopts the running default jail.
-#   B: a conflicting same-profile spawn sharing the jail path is refused.
-#   C: the reverse leak order (forge first, then default) converges on one container.
-#   D: per-task buckets sharing only sandbox dirs coexist (D1), a non-default spawn sharing a
-#      real jail path is still refused (D2), and a default spawn whose volumes diverge from the
-#      running default jail is refused rather than replacing it (D3).
-#   E: daemon-restart ordering — with the default jail stopped, forge comes up first; the default
-#      spawn's stopped by-label hit must adopt the running forge container, never start beside it.
-#   E2: exec recovery inside a live process restarts its own (adopted, foreign-labeled) container.
-#   F: two envs share one default jail with no host volumes (A-E all carry a real jail bind);
-#      after an out-of-band `docker rm` the first recreates it and the second's recovery adopts it.
-#   G: a default respawn that adds a named volume (invisible to the bind model, only its environment
-#      fingerprint differs) replaces the running default container instead of adopting it.
+# Live-daemon repro for duplicate jail mounts (t_44fdd37a): one identity, the reuse fingerprint,
+# names the container (hermes-<fp12>). Touches only containers it created that mount a path under
+# its own throwaway root. Exit: 0 pass, 1 fail, 77 skip.
+#   A: a respawn of one configuration attaches to the container under its canonical name.
+#   B: another task bucket sharing a running jail's path RW is refused, naming the holder, in
+#      either order (default first, then forge in a fresh root).
+#   C: a same-bucket spawn whose volumes diverge while sharing the jail RW is refused.
+#   D: per-task buckets sharing only sandbox dirs coexist.
+#   E: daemon-restart ordering — with the default jail stopped, forge comes up first; starting the
+#      stopped default jail beside it is refused, never a second holder of the path.
+#   E2: exec recovery inside a live process restarts its own container by name.
+#   F: two envs share one container with no host volumes; after an out-of-band `docker rm` the
+#      first recreates it under the canonical name and the second's recovery attaches to it.
+#   G': a respawn that adds a named volume is a new fingerprint, so a new name: the stale container
+#      is neither adopted nor removed (it is the orphan reaper's once it exits).
+#   H: two concurrent spawns of one configuration converge on exactly one container, and both
+#      processes can exec in it.
 set -u
 cd "$(dirname "$0")/.."
 PY=${HERMES_PYTHON:-.venv/bin/python}
-export IMAGE=bash:5  # alpine + bash: execute() runs every command through bash (E2)
+export IMAGE=bash:5  # alpine + bash: execute() runs every command through bash (E2, F, H)
 
 skip() { echo "SKIP: $*"; exit 77; }
 fail() { echo "FAIL: $*"; exit 1; }
@@ -37,7 +39,7 @@ export CREATED_IDS=$T/created.ids
 cleanup() {
   local rc=$? id
   while read -r id; do
-    grep -q "^$id" "$T/pre.ids" && continue  # adopted ids are the short form
+    grep -q "^$id" "$T/pre.ids" && continue
     docker inspect --format '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' "$id" 2>/dev/null \
       | grep -q "^$T/" && docker rm -f "$id" >/dev/null
   done <"$CREATED_IDS"
@@ -48,6 +50,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# HERMES_HOME is a fingerprint input, so every name this run derives is unique to $T.
 export HERMES_HOME=$T/home TERMINAL_SANDBOX_DIR=$T/sandboxes
 # Python's tempdir must not contain the jails: process-tempdir mounts are volatile by design
 # and carry no jail identity, which would hide every mount under $T from the guard.
@@ -70,12 +73,21 @@ else:
     print(env._container_id)' "$@"
 }
 
-# Adoption keeps the short id `docker ps` reports; a fresh `docker run` returns the long one.
-same_container() { [ -n "$1" ] && [ "${1:0:12}" = "${2:0:12}" ]; }
+same_container() { [ -n "$1" ] && [ "$1" = "$2" ]; }
 
-holders() {  # running hermes containers bind-mounting $1
-  local n=0 id
-  for id in $(docker ps -q --filter label=hermes-agent=1 --filter status=running); do
+running() { [ "$(docker inspect --format '{{.State.Running}}' "$1" 2>/dev/null)" = true ]; }
+
+canonical_name() {  # prints the container's name, failing unless it is hermes-<fp12>
+  local name
+  name=$(docker inspect --format '{{.Name}}' "$1") || fail "cannot inspect $1"
+  [[ $name =~ ^/hermes-[0-9a-f]{12}$ ]] || fail "container $1 is named $name, not hermes-<fp12>"
+  echo "${name#/}"
+}
+
+holders() {  # hermes containers bind-mounting $1: running ones, or all with -a as $2
+  local n=0 id state=(--filter status=running)
+  [ "${2:-}" = -a ] && state=(-a)
+  for id in $(docker ps -q --filter label=hermes-agent=1 "${state[@]}"); do
     docker inspect --format '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' "$id" | grep -qxF "$1" && n=$((n + 1))
   done
   echo "$n"
@@ -90,99 +102,78 @@ assert_single_jail() {
   echo "PASS single-jail-invariant"
 }
 
-# A: the live leak shape — "default" holds the jail, a "profile:forge" spawn must adopt it.
+expect_refusal() {  # expect_refusal <scenario> <holder id> <spawn output>
+  case "$3" in
+    "REFUSED "*"already bind-mounted read-write"*"${2:0:12}"*) echo "PASS $1" ;;
+    *) fail "$1: expected a refusal naming ${2:0:12}, got: $3" ;;
+  esac
+}
+
+# A: one configuration, two processes, one container under the canonical name.
 id1=$(spawn default "$A:/home/bot") || fail "scenario A default spawn crashed"
-id2=$(spawn profile:forge "$A:/home/bot") || fail "scenario A forge spawn crashed"
-same_container "$id1" "$id2" || fail "profile:forge got $id2, not the default jail $id1"
-echo "PASS adopt-across-buckets"
+case "$id1" in REFUSED*) fail "scenario A default spawn refused: $id1" ;; esac
+canonical_name "$id1" >/dev/null
+id2=$(spawn default "$A:/home/bot") || fail "scenario A respawn crashed"
+same_container "$id1" "$id2" || fail "respawn got $id2, not the named container $id1"
+echo "PASS respawn-attaches-by-name"
 assert_single_jail "$A"
 
-# B: same profile, mounts differ beyond the sandbox bucket while sharing jail A read-write.
-out=$(spawn second:bucket "$A:/home/bot" "$B:/extra") || fail "scenario B spawn crashed: $out"
-case "$out" in
-  "REFUSED "*"already bind-mounted read-write"*) echo "PASS refuse-on-conflicting-identity" ;;
-  *) fail "expected a refusal, got: $out" ;;
-esac
-[ "$(holders "$B")" = 0 ] || fail "refused spawn left a container on $B"
-assert_single_jail "$A"
-
-# C: reverse order in a fresh sandbox root — forge creates first, default must adopt it.
+# B: the live leak shape — "default" holds the jail, a "profile:forge" spawn is another identity.
+out=$(spawn profile:forge "$A:/home/bot") || fail "scenario B forge spawn crashed: $out"
+expect_refusal refuse-other-bucket-on-held-jail "$id1" "$out"
+# Reverse order in a fresh sandbox root: forge holds the jail, default is refused.
 export TERMINAL_SANDBOX_DIR=$T/sbxT
-idF=$(spawn profile:forge "$C:/home/bot") || fail "scenario C forge spawn crashed"
-idD=$(spawn default "$C:/home/bot") || fail "scenario C default spawn crashed"
-same_container "$idF" "$idD" || fail "default got $idD, not the forge jail $idF"
-echo "PASS selfheal-default-adopts-leaked-forge-jail"
+idF=$(spawn profile:forge "$C:/home/bot") || fail "scenario B forge-first spawn crashed"
+out=$(spawn default "$C:/home/bot") || fail "scenario B default spawn crashed: $out"
+expect_refusal refuse-default-on-forge-held-jail "$idF" "$out"
 assert_single_jail "$A" "$C"
 
-# D1: rollouts under one profile, no volumes — only per-task sandbox dirs, which coexist.
-export TERMINAL_SANDBOX_DIR=$T/sbxT2
-id3=$(spawn rollout:one) || fail "scenario D1 rollout:one spawn crashed"
-id4=$(spawn rollout:two) || fail "scenario D1 rollout:two spawn crashed"
-[ "${#id3}" = 64 ] && [ "${#id4}" = 64 ] && [ "$id3" != "$id4" ] \
-  || fail "rollouts must get fresh containers of their own, got $id3 / $id4"
-for id in "$id3" "$id4"; do
-  [ "$(docker inspect --format '{{.State.Running}}' "$id")" = true ] || fail "rollout container $id not running"
-done
-echo "PASS rollout-isolation"
-
-# D2: a non-default bucket sharing jail A's real path is refused (A's default side is theirs).
-# Under A's sandbox root, as one profile's processes are: the jail shape is recognised by the
-# candidate's sandbox binds, which a spawn only sees as such under its own root.
+# C: same bucket, volumes diverge while sharing jail A read-write: a new fingerprint, refused.
 export TERMINAL_SANDBOX_DIR=$T/sandboxes
-out=$(spawn rollout:three "$A:/home/bot" "$B:/extra") || fail "scenario D2 spawn crashed: $out"
-case "$out" in
-  "REFUSED "*"already bind-mounted read-write"*) echo "PASS refuse-non-default-side" ;;
-  *) fail "expected a refusal, got: $out" ;;
-esac
-[ "$(holders "$B")" = 0 ] || fail "refused spawn left a container on $B"
-
-# D3: an edited docker_volumes on the default bucket diverges from the running jail's binds; that
-# sibling may hold a live sandbox, so the spawn refuses instead of replacing it. The genuine replace
-# (identical binds, egress/image drift) needs a config mutation mid-run — the unit tests cover it.
-id5=$(spawn default "$A:/home/bot") || fail "scenario D3 default respawn crashed"
-same_container "$id1" "$id5" || fail "unchanged default config got $id5, not the jail $id1"
-out=$(spawn default "$A:/home/bot" "$B:/extra") || fail "scenario D3 drifted spawn crashed: $out"
-case "$out" in
-  "REFUSED "*"already bind-mounted read-write"*) echo "PASS refuse-on-default-bind-divergence" ;;
-  *) fail "expected a refusal, got: $out" ;;
-esac
-[ "$(holders "$B")" = 0 ] || fail "refused spawn left a container on $B"
+out=$(spawn default "$A:/home/bot" "$B:/extra") || fail "scenario C spawn crashed: $out"
+expect_refusal refuse-divergent-volumes "$id1" "$out"
+[ "$(holders "$B" -a)" = 0 ] || fail "refused spawn left a container on $B"
 assert_single_jail "$A"
 
-# E: daemon restart leaves the default jail stopped and forge recovers first (fresh: nothing runs
-# to adopt). The default spawn then label-hits its stopped jail; the start is mount-gated and must
-# adopt forge's running container instead of making a second holder of the jail path.
+# D: rollouts under one profile, no volumes — only per-task sandbox dirs, which coexist.
+export TERMINAL_SANDBOX_DIR=$T/sbxD
+id3=$(spawn rollout:one) || fail "scenario D rollout:one spawn crashed"
+id4=$(spawn rollout:two) || fail "scenario D rollout:two spawn crashed"
+[ "$id3" != "$id4" ] && running "$id3" && running "$id4" \
+  || fail "rollouts must get running containers of their own, got $id3 / $id4"
+echo "PASS rollout-isolation"
+
+# E: daemon restart leaves the default jail stopped and forge recovers first (nothing running holds
+# the path, so it starts). Starting the stopped default jail beside it would double-mount the path.
 export TERMINAL_SANDBOX_DIR=$T/sbxE
 idX=$(spawn default "$E:/home/bot") || fail "scenario E default spawn crashed"
 docker stop "$idX" >/dev/null || fail "could not stop $idX"
 idY=$(spawn profile:forge "$E:/home/bot") || fail "scenario E forge spawn crashed"
 case "$idY" in REFUSED*) fail "forge must start fresh with nothing running, got: $idY" ;; esac
 same_container "$idX" "$idY" && fail "forge started the stopped default jail $idX"
-[ "$(docker inspect --format '{{.State.Running}}' "$idY")" = true ] || fail "forge container $idY not running"
-idZ=$(spawn default "$E:/home/bot") || fail "scenario E default respawn crashed"
-same_container "$idY" "$idZ" || fail "default got $idZ, not the running forge jail $idY"
-echo "PASS restart-order-forge-first-default-converges"
+running "$idY" || fail "forge container $idY not running"
+out=$(spawn default "$E:/home/bot") || fail "scenario E default respawn crashed: $out"
+expect_refusal restart-order-refuses-second-holder "$idY" "$out"
+running "$idX" && fail "the refused default jail $idX was started"
 assert_single_jail "$E"
 
-# E2: the daemon restarts under a live process. Its default env adopted forge's container (labels
-# not its own), so label search would miss it: recovery must restart that container, not run anew.
+# E2: the daemon restarts under a live process: recovery restarts the container by name, not anew.
+export TERMINAL_SANDBOX_DIR=$T/sbxE2
 out=$("$PY" -c '
-import os, subprocess, sys
+import os, subprocess
 from tools.environments.docker import DockerEnvironment
-env = DockerEnvironment(image=os.environ["IMAGE"], cwd="/", task_id="default",
-                        volumes=sys.argv[1:], persistent_filesystem=True)
+env = DockerEnvironment(image=os.environ["IMAGE"], cwd="/", task_id="default", volumes=[], persistent_filesystem=True)
 with open(os.environ["CREATED_IDS"], "a") as f:
     f.write(env._container_id + "\n")
 before = env._container_id
 subprocess.run(["docker", "stop", before], check=True, capture_output=True)
 result = env.execute("echo alive")
-print(before, env._container_id, "alive" in result.get("output", ""))' "$E:/home/bot") \
+print(before, env._container_id, "alive" in result.get("output", ""))') \
   || fail "scenario E2 crashed: $out"
 read -r before after alive <<<"$out"
 [ "$alive" = True ] || fail "exec after recovery did not run: $out"
-same_container "$idY" "$before" || fail "E2 env attached $before, not the jail $idY"
 [ "$before" = "$after" ] || fail "recovery switched $before to $after instead of restarting it"
-echo "PASS recovery-restarts-adopted-jail"
+echo "PASS recovery-restarts-named-container"
 assert_single_jail "$A" "$C" "$E"
 
 # F: a refused recovery would leave B's every later exec asserting "Container not started".
@@ -195,7 +186,7 @@ a = DockerEnvironment(**kw)
 with open(os.environ["CREATED_IDS"], "a") as f:
     f.write(a._container_id + "\n")
 b = DockerEnvironment(**kw)
-assert a._container_id[:12] == b._container_id[:12], (a._container_id, b._container_id)
+assert a._container_id == b._container_id, (a._container_id, b._container_id)
 subprocess.run(["docker", "rm", "-f", a._container_id], check=True, capture_output=True)
 ra = a.execute("echo alive")
 rb = b.execute("echo alive")
@@ -204,20 +195,47 @@ print(a._container_id, b._container_id, "alive" in ra.get("output", ""), "alive"
 read -r idA idB aliveA aliveB <<<"$out"
 printf '%s\n' "$idA" "$idB" >>"$CREATED_IDS"
 [ "$aliveA" = True ] && [ "$aliveB" = True ] || fail "exec after recovery did not run in both envs: $out"
-same_container "$idA" "$idB" || fail "B recovered into $idB, not A's recreated jail $idA: $out"
-echo "PASS no-host-volume-default-twin-adopts"
+same_container "$idA" "$idB" || fail "B recovered into $idB, not A's recreated container $idA: $out"
+canonical_name "$idA" >/dev/null
+echo "PASS no-host-volume-twin-recovers-by-name"
 assert_single_jail "$T/sbxF/docker/default/home" "$T/sbxF/docker/default/workspace"
 
-# G: A-F differ only in binds. A named volume is invisible to the bind model, so only the
-# environment fingerprint tells this default twin is stale: adopting it would drop the volume.
+# G': a named volume is invisible to the bind model; only the fingerprint sees the drift. The new
+# configuration gets its own name; the stale container is left running, neither adopted nor removed.
 export TERMINAL_SANDBOX_DIR=$T/sbxG
-idOld=$(spawn default) || fail "scenario G default spawn crashed"
-idG=$(spawn default "$GVOL:/data") || fail "scenario G drifted spawn crashed: $idG"
-[ "${#idG}" = 64 ] && [ "$idG" != "$idOld" ] || fail "drifted default must replace $idOld with a fresh container, got: $idG"
-[ "$(docker inspect --format '{{.State.Running}}' "$idOld" 2>/dev/null)" = true ] && fail "stale default $idOld still running"
+idOld=$(spawn default) || fail "scenario G' default spawn crashed"
+idG=$(spawn default "$GVOL:/data") || fail "scenario G' drifted spawn crashed: $idG"
+case "$idG" in REFUSED*) fail "named-volume drift shares only sandbox dirs, got: $idG" ;; esac
+[ "$idG" != "$idOld" ] || fail "drifted config adopted the stale container $idOld"
+[ "$(canonical_name "$idG")" != "$(canonical_name "$idOld")" ] || fail "drifted config kept the stale name"
+running "$idOld" || fail "drift spawn stopped or removed the stale container $idOld"
 docker inspect --format '{{range .Mounts}}{{.Type}}:{{.Destination}}{{"\n"}}{{end}}' "$idG" | grep -qx volume:/data \
-  || fail "replacement $idG does not carry the named volume"
-echo "PASS default-fingerprint-drift-replaces"
-assert_single_jail "$T/sbxG/docker/default/home"
+  || fail "new container $idG does not carry the named volume"
+echo "PASS fingerprint-drift-gets-new-name"
+
+# H: two processes of one configuration spawn at the same instant (both probe before either runs);
+# the name makes `docker run` the atomic duplicate test, so the loser attaches to the winner.
+export TERMINAL_SANDBOX_DIR=$T/sbxH GO_AT=$(($(date +%s) + 3))
+race() {
+  "$PY" -c '
+import os, time
+from tools.environments.docker import DockerEnvironment
+time.sleep(max(0.0, int(os.environ["GO_AT"]) - time.time()))
+env = DockerEnvironment(image=os.environ["IMAGE"], cwd="/", task_id="default", volumes=[], persistent_filesystem=True)
+with open(os.environ["CREATED_IDS"], "a") as f:
+    f.write(env._container_id + "\n")
+print(env._container_id, "alive" in env.execute("echo alive").get("output", ""))' >"$T/race.$1" 2>"$T/race.$1.err"
+}
+race 1 & pid1=$!
+race 2 & pid2=$!
+wait "$pid1" || fail "scenario H racer 1 crashed: $(tail -5 "$T/race.1.err")"
+wait "$pid2" || fail "scenario H racer 2 crashed: $(tail -5 "$T/race.2.err")"
+read -r idH1 aliveH1 <"$T/race.1"
+read -r idH2 aliveH2 <"$T/race.2"
+same_container "$idH1" "$idH2" || fail "racers got $idH1 / $idH2, not one container"
+[ "$aliveH1" = True ] && [ "$aliveH2" = True ] || fail "exec failed in a racer: $aliveH1 / $aliveH2"
+n=$(holders "$T/sbxH/docker/default/home" -a)
+[ "$n" = 1 ] || fail "$n containers (any state) mount the raced sandbox (want 1)"
+echo "PASS concurrent-spawn-converges"
 
 echo "ALL PASS"
