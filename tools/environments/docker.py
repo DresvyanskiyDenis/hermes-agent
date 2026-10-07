@@ -620,6 +620,72 @@ def _abs_host_cwd(host_cwd: str) -> str:
     return os.path.abspath(expanded)
 
 
+_SANDBOX_TOKEN = "<sandbox>"
+# Hardening tmpfs every hermes container carries identically (Docker lists none in .Mounts):
+# only a tmpfs elsewhere (/root, /home, /workspace) makes a spawn's filesystem differ from a jail.
+_HARDENING_TMPFS = frozenset(
+    arg.split(":", 1)[0] for arg in (*_BASE_SECURITY_ARGS, *_RUN_TMPFS_NOEXEC) if arg.startswith("/"))
+
+
+def _persistent_sandbox_root() -> str | None:
+    """Resolved parent of the per-task persistent sandbox dirs, or ``None`` when unknown."""
+    try:
+        from tools.environments.base import get_sandbox_dir
+    except ImportError:
+        return None
+    return os.path.realpath(get_sandbox_dir() / "docker")
+
+
+def _canonical_bind_source(path: str, sandbox_root: str | None) -> str:
+    """Host bind source as jail identity: ``~`` expanded, slash style folded, symlinks resolved
+    when the path exists, and ``<sandbox_root>/<task bucket>/rest`` collapsed to
+    ``<sandbox>/rest`` — the bucket is the one component two task buckets of the same jail
+    never share, which is why label-keyed reuse can never match across buckets."""
+    source = _host_path_key(os.path.expanduser(path))
+    if os.path.exists(source):
+        source = os.path.realpath(source)
+    if sandbox_root and source.startswith(sandbox_root + os.sep):
+        rest = source[len(sandbox_root) + 1:].partition(os.sep)[2]
+        return f"{_SANDBOX_TOKEN}/{rest}" if rest else _SANDBOX_TOKEN
+    return source
+
+
+def _parse_mount_pair_args(run_args: list[str]) -> tuple[list[tuple[str, str, bool]], bool]:
+    """``([(source, destination, rw)], has_tmpfs)`` from the ``-v``/``--volume``,
+    ``--mount`` and ``--tmpfs`` flag+value pairs of a ``docker run`` argv."""
+    binds: list[tuple[str, str, bool]] = []
+    has_tmpfs = False
+    for flag, spec in zip(run_args, run_args[1:]):
+        if flag in ("-v", "--volume"):
+            parsed = _split_volume_spec(spec)
+            if parsed:
+                mode = spec.strip()[len(parsed[0]) + len(parsed[1]) + 2:]
+                binds.append((*parsed, "ro" not in mode.split(",")))
+        elif flag == "--mount":
+            opts = dict(kv.partition("=")[::2] for kv in spec.split(","))
+            dest = opts.get("destination") or opts.get("dst") or opts.get("target", "")
+            kind = opts.get("type", "volume")
+            if kind == "tmpfs":
+                has_tmpfs = has_tmpfs or dest not in _HARDENING_TMPFS
+            elif kind == "bind":
+                readonly = opts.get("readonly", opts.get("ro"))
+                binds.append((opts.get("source") or opts.get("src", ""), dest,
+                              readonly is None or readonly.lower() in ("false", "0")))
+            # Named volumes live in Docker's store, not at a host path a second spawn could double-mount.
+        elif flag == "--tmpfs":
+            has_tmpfs = has_tmpfs or spec.split(":", 1)[0] not in _HARDENING_TMPFS
+    return binds, has_tmpfs
+
+
+def _bind_model(binds, sandbox_root: str | None) -> list[tuple[str, str, bool]]:
+    """Canonical ``(source, destination, rw)`` binds sorted by destination; per-process tempdir
+    sources (the symlink-safe skills copy) are random per process and carry no jail identity.
+    Sorted because ``docker inspect`` lists ``.Mounts`` in map order, not argv order (Docker
+    29), and Docker rejects duplicate destinations, so argv order carries no override meaning."""
+    return sorted((_canonical_bind_source(source, sandbox_root), dest, rw)
+                  for source, dest, rw in binds if not _is_volatile_mount_spec(f"{source}:{dest}"))
+
+
 class DockerEnvironment(BaseEnvironment):
     """Hardened Docker container execution (caps dropped, no-new-privileges, PID limits,
     size-limited tmpfs). The container is the security boundary — its filesystem stays
@@ -744,9 +810,12 @@ class DockerEnvironment(BaseEnvironment):
         self._image_pinned = image_pinned
         self._image_uses_s6_init = image_uses_s6_init
         self._all_run_args = all_run_args
+        self._network = network
 
         reused = persist_across_processes and self._attach_existing_container(
             task_label, profile_name, egress_label, network)
+        if not reused:
+            reused = self._adopt_or_refuse_mount_conflict()
         if not reused:
             self._container_id = self._docker_run(cwd)
 
@@ -968,6 +1037,111 @@ class DockerEnvironment(BaseEnvironment):
             container_id[:12], task_label, profile_name, state)
         return True
 
+    def _adopt_or_refuse_mount_conflict(self) -> bool:
+        """Mount-aware fallback after a label-reuse miss, keeping the invariant: no two RUNNING
+        hermes-labeled containers with the same ``hermes-profile`` mount the same host path RW.
+        The environment label hashes the per-task sandbox dirs, so a spawn under another task
+        bucket (``profile:forge`` vs ``default``) never label-matches the jail it would double-mount.
+
+        ADOPT a same-profile, same-egress running container whose binds equal ours modulo the
+        sandbox bucket, with a compatible image and network. REFUSE (``RuntimeError``) when a
+        same-profile one shares a RW host source but differs otherwise. Else PROCEED (``False``).
+        A tmpfs /root cannot be proven equivalent to a bound one, so a tmpfs spawn never adopts. Foreign-profile RW overlap only warns: profiles
+        sharing one jail path is outside the reuse design, and refusing would break legitimately
+        shared estate paths. A read-only side never conflicts. Probe failures proceed — this must
+        never brick startup."""
+        if not self._persist_across_processes:
+            return False
+        root = _persistent_sandbox_root()
+        binds, has_tmpfs = _parse_mount_pair_args(self._all_run_args)
+        ours = _bind_model(binds, root)
+        result = _docker_query(
+            [self._docker_exe, "ps", "--filter", "label=hermes-agent=1", "--filter", "status=running",
+             "--format", "{{.ID}}"], timeout=10,
+            fail="docker ps mount-conflict probe failed: %s",
+            nonzero="docker ps mount-conflict probe returned %d: %s")
+        if result is None:
+            return False
+        adopted = refusal = None
+        for cid in result.stdout.split():
+            if cid == self._container_id:
+                continue
+            labels = self._inspect_json(cid, "{{json .Config.Labels}}")
+            mounts = self._inspect_json(cid, "{{json .Mounts}}")
+            if not isinstance(labels, dict) or not isinstance(mounts, list):
+                logger.debug("Mount-conflict probe skipping %s: unreadable inspect output", cid[:12])
+                continue
+            theirs = _bind_model([
+                (m.get("Source", ""), m.get("Destination", ""), m.get("RW") is True)
+                for m in mounts if isinstance(m, dict) and m.get("Type") == "bind"], root)
+            same_profile = labels.get("hermes-profile") == self._labels["hermes-profile"]
+            if (same_profile and theirs and theirs == ours and not has_tmpfs
+                    and labels.get(_EGRESS_LABEL_KEY) == self._labels[_EGRESS_LABEL_KEY]
+                    and self._runtime_adoptable(cid)):
+                if adopted is None:
+                    adopted = (cid, labels)
+                else:
+                    logger.warning(
+                        "Container %s duplicates adopted jail %s (same profile and mounts) — stale "
+                        "duplicate, remove it with `docker rm -f %s`", cid[:12], adopted[0][:12], cid[:12])
+                continue
+            our_rw = {source for source, _, rw in ours if rw}
+            # A real host path names the conflict better than a <sandbox> token.
+            shared = sorted((s for s, _, rw in theirs if rw and s in our_rw),
+                            key=lambda s: s.startswith(_SANDBOX_TOKEN))
+            if shared and not same_profile:
+                logger.warning(
+                    "Running container %s (profile=%r) also bind-mounts %s read-write; profiles sharing "
+                    "one jail path are outside the reuse design — starting a separate container",
+                    cid[:12], labels.get("hermes-profile"), shared[0])
+            elif shared and refusal is None:
+                refusal = (cid, labels, shared[0])
+        if adopted is not None:
+            cid, labels = adopted
+            self._container_id = cid
+            logger.info(
+                "Adopted running container %s held under task label %r (profile=%s, this task=%r): "
+                "identical jail mounts modulo per-task sandbox dirs — refusing to double-mount the "
+                "same host paths", cid[:12], labels.get("hermes-task-id"), self._labels["hermes-profile"],
+                self._task_id)
+            return True
+        if refusal is not None:
+            cid, labels, source = refusal
+            raise RuntimeError(
+                f"Refusing to start a duplicate sandbox container: host path {source} is already "
+                f"bind-mounted read-write by running hermes container {cid[:12]} "
+                f"(task={labels.get('hermes-task-id')!r}, profile={labels.get('hermes-profile')!r}) with a "
+                "conflicting sandbox identity (egress/image/network/mounts). Stop or remove that "
+                "container, or spawn under a matching task identity to reuse it.")
+        return False
+
+    def _inspect_json(self, container_id: str, template: str):
+        """Decoded ``docker inspect --format <json template>`` output, or ``None`` on any failure."""
+        result = _docker_query(
+            [self._docker_exe, "inspect", "--format", template, container_id], timeout=10,
+            fail="docker inspect %s failed: %s", fail_args=(template,),
+            nonzero="docker inspect %s returned %d: %s")
+        if result is None:
+            return None
+        try:
+            return json.loads(result.stdout)
+        except ValueError:
+            logger.debug("docker inspect %s returned malformed JSON for %s", template, container_id[:12])
+            return None
+
+    def _runtime_adoptable(self, container_id: str) -> bool:
+        """Image and network checks of ``_attach_existing_container``, without its removals: a pinned
+        image must match (an unpinned mismatch keeps the existing sandbox), and an air-gapped
+        spawn adopts only a ``none``-network container. Failed probes fail closed."""
+        actual_image = self._container_image(container_id)
+        if actual_image != self._image:
+            if self._image_pinned:
+                return False
+            logger.warning(
+                "Adoptable container %s runs image %s, not the default docker_image %s — keeping the "
+                "existing sandbox", container_id[:12], actual_image, self._image)
+        return self._network or self._container_network_mode(container_id) == "none"
+
     def _image_available_locally(self) -> bool:
         """True once ``self._image`` is in the local image store, pulling it when it is not. Called BEFORE a
         container replacement removes anything: a pull that fails must leave the old sandbox intact."""
@@ -1125,6 +1299,12 @@ class DockerEnvironment(BaseEnvironment):
             else:
                 logger.warning("Recovery: failed to start container %s: %s", cid[:12], err)
 
+        if not self._container_id:
+            try:
+                self._adopt_or_refuse_mount_conflict()
+            except RuntimeError as e:
+                logger.error("Recovery: %s", e)
+                return False
         if not self._container_id:
             if not self._image:
                 logger.error("Recovery: no saved image name, cannot recreate container")

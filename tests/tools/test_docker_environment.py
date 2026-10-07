@@ -812,7 +812,7 @@ def test_reuse_probe_filters_on_environment_fingerprint(monkeypatch, tmp_path, c
 
     def reuse_filters():
         return tuple(
-            arg for cmd, _ in calls if isinstance(cmd, list) and cmd[1] == "ps"
+            arg for cmd, _ in calls if isinstance(cmd, list) and cmd[1:3] == ["ps", "-a"]
             for arg in cmd if arg.startswith("label=")
         )
 
@@ -997,7 +997,7 @@ def test_egress_enabled_does_not_reuse_pre_egress_container(monkeypatch):
             sub = cmd[1]
             if sub == "version":
                 return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
-            if sub == "ps":
+            if cmd[1:3] == ["ps", "-a"]:
                 # Simulate an old pre-egress container: without the egress label
                 # filter it would match; with the filter Docker returns no match.
                 assert any(str(part).startswith("label=hermes-egress=") for part in cmd)
