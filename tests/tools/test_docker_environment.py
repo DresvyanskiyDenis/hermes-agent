@@ -836,6 +836,8 @@ def test_reuse_probe_filters_on_environment_fingerprint(monkeypatch, tmp_path, c
     assert set(f.removeprefix("label=") for f in changed_filters) <= _labels_in_run_args(_run_args_from_calls(calls))
 
     calls.clear()
+    # Recovery restarts its own container first; label reuse runs once that one is gone.
+    monkeypatch.setattr(env, "_start_container", lambda cid: RuntimeError("No such container"))
     assert env._recreate_container()
     assert reuse_filters() == changed_filters
 

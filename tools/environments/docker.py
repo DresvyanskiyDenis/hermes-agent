@@ -647,15 +647,35 @@ def _canonical_bind_source(path: str, sandbox_root: str) -> str:
     return source
 
 
+def _split_joined_mount_flags(run_args: list[str]):
+    """``--volume=x``, ``--mount=x``, ``--tmpfs=x`` and ``-vx`` as separate flag and value tokens."""
+    for arg in run_args:
+        if arg.startswith(("--volume=", "--mount=", "--tmpfs=")):
+            yield from arg.split("=", 1)
+        elif arg.startswith("-v") and len(arg) > 2 and arg[2] != "-":
+            yield from ("-v", arg[2:])
+        else:
+            yield arg
+
+
+def _is_named_volume(source: str) -> bool:
+    """``-v name:/path``: a Docker-store volume, not a host path (no separator, ``~``, drive or ``.``)."""
+    return not (source.startswith(("~", ".")) or "/" in source or "\\" in source
+                or _is_windows_drive_path(source))
+
+
 def _parse_mount_pair_args(run_args: list[str]) -> tuple[list[tuple[str, str, bool]], bool]:
     """``([(source, destination, rw)], has_tmpfs)`` from the ``-v``/``--volume``,
-    ``--mount`` and ``--tmpfs`` flag+value pairs of a ``docker run`` argv."""
+    ``--mount`` and ``--tmpfs`` flags of a ``docker run`` argv, joined (``--volume=x``)
+    or separate. Named volumes live in Docker's store, not at a host path a second spawn
+    could double-mount, and ``docker inspect`` lists only binds — so they are skipped."""
+    run_args = list(_split_joined_mount_flags(run_args))
     binds: list[tuple[str, str, bool]] = []
     has_tmpfs = False
     for flag, spec in zip(run_args, run_args[1:]):
         if flag in ("-v", "--volume"):
             parsed = _split_volume_spec(spec)
-            if parsed:  # without a mode the last field is the destination, never "ro"
+            if parsed and not _is_named_volume(parsed[0]):  # without a mode the last field is the destination
                 binds.append((*parsed, "ro" not in spec.rpartition(":")[2].split(",")))
         elif flag == "--mount":
             opts = dict(kv.partition("=")[::2] for kv in spec.split(","))
@@ -667,7 +687,6 @@ def _parse_mount_pair_args(run_args: list[str]) -> tuple[list[tuple[str, str, bo
                 readonly = opts.get("readonly", opts.get("ro"))
                 binds.append((opts.get("source") or opts.get("src", ""), dest,
                               readonly is None or readonly.lower() in ("false", "0")))
-            # Named volumes live in Docker's store, not at a host path a second spawn could double-mount.
         elif flag == "--tmpfs":
             has_tmpfs = has_tmpfs or spec.split(":", 1)[0] not in _HARDENING_TMPFS
     return binds, has_tmpfs
@@ -680,6 +699,42 @@ def _bind_model(binds, sandbox_root: str) -> list[tuple[str, str, bool]]:
     29), and Docker rejects duplicate destinations, so argv order carries no override meaning."""
     return sorted((_canonical_bind_source(source, sandbox_root), dest, rw)
                   for source, dest, rw in binds if not _is_volatile_mount_spec(f"{source}:{dest}"))
+
+
+def _classify_jail_candidate(our_labels, ours, has_tmpfs, labels, theirs) -> tuple[bool, str | None, str | None]:
+    """``(same_jail, verdict, path)`` for one running hermes container against our spawn, from labels
+    and canonical bind models alone (runtime image/network checks are the caller's).
+
+    ``same_jail``: adoptable modulo runtime — same profile, one side the ``default`` bucket, equal
+    binds that include a real shared RW path, same egress, no tmpfs spawn. ``verdict`` is the outcome
+    when it is NOT adopted, ``path`` the colliding RW source to name (a real one when any):
+
+    - ``"replace"``: default↔default with equal binds — config evolution (egress/image/network).
+    - ``"refuse"``: the leak class — same profile, one side ``default``, a candidate carrying
+      ``<sandbox>`` binds (a hermes persistent container) and a colliding RW path.
+    - ``"warn"``: any other real-path overlap (foreign profile, two non-default buckets).
+    - ``None``: nothing collides; a fresh container is correct.
+
+    One bucket on both sides means the same literal sandbox dirs, so a ``<sandbox>`` overlap
+    collides only for default↔default; across buckets those dirs are distinct by design."""
+    same_profile = labels.get("hermes-profile") == our_labels["hermes-profile"]
+    our_default = our_labels["hermes-task-id"] == "default"
+    their_default = labels.get("hermes-task-id") == "default"
+    our_rw = {source for source, _, rw in ours if rw}
+    shared_rw = [s for s, _, rw in theirs if rw and s in our_rw]
+    real_shared = [s for s in shared_rw if not s.startswith(_SANDBOX_TOKEN)]
+    colliding = shared_rw if same_profile and our_default and their_default else real_shared
+    if not colliding:
+        return False, None, None
+    path = min(real_shared, default=None) or min(colliding)
+    jail_side = same_profile and (our_default or their_default)
+    same_jail = (jail_side and bool(real_shared) and theirs == ours and not has_tmpfs
+                 and labels.get(_EGRESS_LABEL_KEY) == our_labels[_EGRESS_LABEL_KEY])
+    if jail_side and our_default and their_default and theirs == ours:
+        return same_jail, "replace", path
+    if jail_side and any(s.startswith(_SANDBOX_TOKEN) for s, _, _ in theirs):
+        return same_jail, "refuse", path
+    return same_jail, "warn", path
 
 
 class DockerEnvironment(BaseEnvironment):
@@ -1020,6 +1075,11 @@ class DockerEnvironment(BaseEnvironment):
                 return False
 
         if state != "running":
+            # Every start is mount-gated: after a daemon restart another bucket's spawn may already
+            # have brought this jail's paths back up. Adopt that twin (or refuse) instead of starting
+            # a second holder; a refusal propagates and fails the spawn.
+            if self._adopt_or_refuse_mount_conflict():
+                return True
             err = self._start_container(container_id)
             if err is not None:
                 logger.warning(
@@ -1034,39 +1094,48 @@ class DockerEnvironment(BaseEnvironment):
         return True
 
     def _adopt_or_refuse_mount_conflict(self, replace: bool = True) -> bool:
-        """Mount-aware fallback after a label-reuse miss. What is forbidden is double-mounting the
-        same REAL host path RW under conflicting sandbox identity; same-profile containers whose
-        only overlap is per-task sandbox dirs coexist by design (RL/benchmark rollouts and
-        per-session isolation run distinct task buckets under one profile on purpose). The
-        environment label hashes the per-task sandbox dirs, so a spawn under another task bucket
-        (``profile:forge`` vs ``default``) never label-matches the jail it would double-mount.
+        """Mount gate for every spawn that misses label reuse and every ``docker start`` of a hermes
+        container (stopped by-label attach, exec recovery). What is forbidden is double-mounting the
+        same host path RW under conflicting sandbox identity; same-profile containers whose only
+        overlap is per-task sandbox dirs coexist by design (RL/benchmark rollouts and per-session
+        isolation run distinct task buckets under one profile on purpose). The environment label
+        hashes the per-task sandbox dirs, so a spawn under another task bucket (``profile:forge``
+        vs ``default``) never label-matches the jail it would double-mount.
 
-        Per running candidate, in order:
+        Per running candidate (``_classify_jail_candidate``), in order:
 
         - ADOPT a same-profile, same-egress container whose binds equal ours modulo the sandbox
-          bucket and include a real shared RW path, with a compatible image and network, when
-          either side is the ``default`` bucket: forge spawn vs default jail, or the reverse.
+          bucket and include a real shared RW path, with the exact same image and a compatible
+          network, when either side is the ``default`` bucket: forge spawn vs default jail, or the
+          reverse. An image mismatch never adopts across buckets — a per-task image override must
+          not run inside the user's jail.
         - REPLACE (``docker rm -f``, then a fresh ``docker run``) a ``default`` container when ours
-          is ``default`` too, shares any RW source and is not adoptable: changed egress, volumes or
-          pinned image. Same bucket means the same literal sandbox dirs, so a tokenized overlap is
-          real here. Matches ``_attach_existing_container``'s remove-and-recreate mismatch policy;
-          a refusal from another candidate wins, so nothing is removed while one would remain.
-          With ``replace=False`` (exec recovery, whose labels may predate the config change) it is
-          refused instead: a stale process must not remove the container its successor recreated.
-        - REFUSE (``RuntimeError``) a same-profile container sharing a real (non-``<sandbox>``) RW
-          host path: rollout:three vs a default jail on $A, other:forge vs other:quux on $A.
+          is ``default`` too and its binds equal ours but it is not adoptable: genuine config
+          evolution (egress, pinned image, network). Replace requires bind-model equality; a mount
+          divergence refuses instead, since the sibling may hold a live sandbox. Before any removal
+          the image policy runs: an unpinned default-image flip, or a replacement image that cannot
+          be pulled, keeps the existing container — but only for pure image drift (same egress and
+          network); any other drift refuses rather than attach a foreign posture. A failed removal
+          refuses too. A refusal from another candidate wins, so nothing is removed while one would
+          remain. With ``replace=False`` (exec recovery, whose labels may predate the config change)
+          it is refused instead: a stale process must not remove the container its successor recreated.
+        - REFUSE (``RuntimeError``) the leak class: same profile, one side ``default``, a candidate
+          carrying ``<sandbox>`` binds and a colliding RW host path, not adoptable — rollout:three
+          vs a default jail on $A, or two default spawns with divergent volumes.
+        - WARN and PROCEED on any other real-path overlap (foreign profile, two non-default buckets
+          on one path: outside the reuse design, and refusing would break shared estate paths).
         - Otherwise PROCEED (``False``): rollout:one vs rollout:two sharing only per-task dirs.
 
-        A tmpfs /root cannot be proven equivalent to a bound one, so a tmpfs spawn never adopts.
-        Foreign-profile real-path overlap only warns: profiles sharing one jail path is outside the
-        reuse design, and refusing would break legitimately shared estate paths. A read-only side
-        never conflicts. Probe failures proceed — this must never brick startup."""
+        Probe-then-run is not atomic: this prevents or self-heals the duplicate-jail class
+        (spawn/restart under a differing task bucket); simultaneous cold races remain possible and
+        converge on the next adopt. A tmpfs /root cannot be proven equivalent to a bound one, so a
+        tmpfs spawn never adopts. A read-only side never conflicts. Probe failures proceed — this
+        must never brick startup."""
         if not self._persist_across_processes:
             return False
         root = _persistent_sandbox_root()
         binds, has_tmpfs = _parse_mount_pair_args(self._all_run_args)
         ours = _bind_model(binds, root)
-        our_rw = {source for source, _, rw in ours if rw}
         result = _docker_query(
             [self._docker_exe, "ps", "--filter", "label=hermes-agent=1", "--filter", "status=running",
              "--format", "{{.ID}}"], timeout=10,
@@ -1074,25 +1143,17 @@ class DockerEnvironment(BaseEnvironment):
             nonzero="docker ps mount-conflict probe returned %d: %s")
         if result is None:
             return False
-        our_default = self._labels["hermes-task-id"] == "default"
         adopted = refusal = None
-        replaceable: list[str] = []
+        replaceable: list[tuple[str, dict, str]] = []
         for cid in result.stdout.split():
+            # Callers probe before setting _container_id; never adopt or refuse our own container.
             if cid == self._container_id:
                 continue
             candidate = self._inspect_jail_candidate(cid, root)
             if candidate is None:
                 continue
             labels, theirs = candidate
-            same_profile = labels.get("hermes-profile") == self._labels["hermes-profile"]
-            their_default = labels.get("hermes-task-id") == "default"
-            shared_rw = [s for s, _, rw in theirs if rw and s in our_rw]
-            real_shared = [s for s in shared_rw if not s.startswith(_SANDBOX_TOKEN)]
-            # Per-task buckets are deliberate isolation; only the profile's canonical default
-            # container is a jail identity another bucket may re-join, and only over a real host
-            # path — with nothing real to double-mount, a fresh container is the correct outcome.
-            same_jail = (same_profile and (our_default or their_default) and real_shared and theirs == ours
-                         and not has_tmpfs and labels.get(_EGRESS_LABEL_KEY) == self._labels[_EGRESS_LABEL_KEY])
+            same_jail, verdict, path = _classify_jail_candidate(self._labels, ours, has_tmpfs, labels, theirs)
             if same_jail and adopted is not None:
                 logger.warning(
                     "Container %s duplicates adopted jail %s (same profile and mounts) — stale "
@@ -1100,23 +1161,15 @@ class DockerEnvironment(BaseEnvironment):
                 continue
             if same_jail and self._runtime_adoptable(cid):
                 adopted = (cid, labels)
-                continue
-            if same_profile and our_default and their_default and shared_rw:
-                if replace:
-                    replaceable.append(cid)
-                    continue
-                shared = min(shared_rw)
-            else:
-                shared = min(real_shared, default=None)
-            if shared is None:
-                continue
-            if not same_profile:
+            elif verdict == "replace" and replace:
+                replaceable.append((cid, labels, path))
+            elif verdict in ("replace", "refuse"):
+                refusal = refusal or (cid, labels, path)
+            elif verdict == "warn":
                 logger.warning(
-                    "Running container %s (profile=%r) also bind-mounts %s read-write; profiles sharing "
-                    "one jail path are outside the reuse design — starting a separate container",
-                    cid[:12], labels.get("hermes-profile"), shared)
-            elif refusal is None:
-                refusal = (cid, labels, shared)
+                    "Running container %s (task=%r, profile=%r) also bind-mounts %s read-write; only a "
+                    "profile's default jail is reused across task buckets — starting a separate container",
+                    cid[:12], labels.get("hermes-task-id"), labels.get("hermes-profile"), path)
         if adopted is not None:
             cid, labels = adopted
             self._container_id = cid
@@ -1128,44 +1181,61 @@ class DockerEnvironment(BaseEnvironment):
             return True
         # Checked before any removal: replacing would still double-mount the refused path.
         if refusal is not None:
-            cid, labels, source = refusal
-            raise RuntimeError(
-                f"Refusing to start a duplicate sandbox container: host path {source} is already "
-                f"bind-mounted read-write by running hermes container {cid[:12]} "
-                f"(task={labels.get('hermes-task-id')!r}, profile={labels.get('hermes-profile')!r}) with a "
-                "conflicting sandbox identity (egress/image/network/mounts). Stop or remove that "
-                "container, or spawn under a matching task identity to reuse it.")
-        if replaceable:
-            # _attach_existing_container's image policy applies before any removal: an unpinned
-            # default-image flip keeps the existing sandbox (its state matters more than the tag),
-            # and a replacement image that cannot be pulled must not cost the profile its only
-            # sandbox — removing first would throw away the writable layer for nothing.
-            first = replaceable[0]
-            actual_image = self._container_image(first)
-            if (actual_image is not None and actual_image != self._image and not self._image_pinned):
-                logger.warning(
-                    "Container %s carries stale sandbox configuration for image %s, but the default "
-                    "docker_image is not pinned — keeping the existing sandbox until it is (profile=%s)",
-                    first[:12], self._image, self._labels["hermes-profile"])
-                self._container_id = first
-                return True
-            if not self._image_available_locally():
-                cid = replaceable[0]
-                logger.warning(
-                    "Container %s carries stale sandbox configuration but image %s could not be "
-                    "pulled — keeping and reusing it until the replacement can start (profile=%s)",
-                    cid[:12], self._image, self._labels["hermes-profile"])
-                self._container_id = cid
-                return True
-            for cid in replaceable:
-                logger.warning(
-                    "Running default container %s shares this profile's jail mounts but its sandbox "
-                    "configuration (egress/image/network/mounts) changed — removing it and starting "
-                    "fresh (profile=%s)", cid[:12], self._labels["hermes-profile"])
-                try:
-                    run_capture([self._docker_exe, "rm", "-f", cid], timeout=30)
-                except (subprocess.TimeoutExpired, OSError) as e:
-                    logger.warning("Failed to remove mismatched container %s: %s", cid[:12], e)
+            raise self._duplicate_refusal(*refusal)
+        return bool(replaceable) and self._replace_drifted_defaults(replaceable)
+
+    def _duplicate_refusal(self, cid: str, labels: dict, source: str, reason: str = "") -> RuntimeError:
+        """The refusal for a spawn that would double-mount *source*. A ``<sandbox>`` path is named
+        only for a default↔default pair, whose buckets are one directory: ours is the host path."""
+        if source.startswith(_SANDBOX_TOKEN):
+            rest = source[len(_SANDBOX_TOKEN):].lstrip("/")
+            bucket = os.path.join(_persistent_sandbox_root(), sanitize_task_id_for_path(self._labels["hermes-task-id"]))
+            source = os.path.join(bucket, rest) if rest else bucket
+        return RuntimeError(
+            f"Refusing to start a duplicate sandbox container: host path {source} is already "
+            f"bind-mounted read-write by running hermes container {cid[:12]} "
+            f"(task={labels.get('hermes-task-id')!r}, profile={labels.get('hermes-profile')!r}) with a "
+            f"conflicting sandbox identity (egress/image/network/mounts){reason}. Stop or remove that "
+            "container, or spawn under a matching task identity to reuse it.")
+
+    def _replace_drifted_defaults(self, replaceable: list[tuple[str, dict, str]]) -> bool:
+        """Remove bind-equal drifted default containers so the caller runs a fresh one (``False``), or
+        keep the first (``True``) when only its image drifted and the switch must wait: an unpinned
+        default-image flip keeps the sandbox someone has state in (``_attach_existing_container``'s
+        policy), and an unpullable replacement must not cost the profile its only sandbox. Any other
+        drift kept that way would attach a foreign egress/network posture, so it refuses instead.
+        A failed removal refuses: never run alongside a container we failed to delete."""
+        first, labels, path = replaceable[0]
+        actual_image = self._container_image(first)
+        unpinned_flip = actual_image is not None and actual_image != self._image and not self._image_pinned
+        if unpinned_flip or not self._image_available_locally():
+            if (labels.get(_EGRESS_LABEL_KEY) != self._labels[_EGRESS_LABEL_KEY]
+                    or not (self._network or self._container_network_mode(first) == "none")):
+                reason = ("; docker_image is not pinned, so it is not replaced" if unpinned_flip
+                          else f"; image {self._image} could not be pulled to replace it")
+                raise self._duplicate_refusal(first, labels, path, reason)
+            logger.warning(
+                "Container %s runs image %s; docker_image is %s but %s — keeping the existing sandbox "
+                "(identical mounts and egress) until it is (profile=%s)", first[:12], actual_image,
+                self._image, "the default image is not pinned" if unpinned_flip else "it could not be pulled",
+                self._labels["hermes-profile"])
+            self._container_id = first
+            return True
+        for cid, _, _ in replaceable:
+            logger.warning(
+                "Running default container %s shares this profile's jail mounts but its sandbox "
+                "configuration (egress/image/network) changed — removing it and starting fresh (profile=%s)",
+                cid[:12], self._labels["hermes-profile"])
+            try:
+                removed = run_capture([self._docker_exe, "rm", "-f", cid], timeout=30)
+                failure = ((removed.stderr or "").strip() or f"exit {removed.returncode}") if removed.returncode else ""
+            except (subprocess.TimeoutExpired, OSError) as e:
+                failure = str(e)
+            if failure:
+                raise RuntimeError(
+                    f"Could not remove stale sandbox container {cid[:12]} to replace it ({failure}); "
+                    "refusing to start a duplicate alongside it — remove it with `docker rm -f "
+                    f"{cid[:12]}` and retry.")
         return False
 
     def _inspect_jail_candidate(self, container_id: str, sandbox_root: str):
@@ -1188,17 +1258,12 @@ class DockerEnvironment(BaseEnvironment):
         return labels, _bind_model(binds, sandbox_root)
 
     def _runtime_adoptable(self, container_id: str) -> bool:
-        """Image and network checks of ``_attach_existing_container``, without its removals: a pinned
-        image must match (an unpinned mismatch keeps the existing sandbox), and an air-gapped
-        spawn adopts only a ``none``-network container. Failed probes fail closed."""
-        actual_image = self._container_image(container_id)
-        if actual_image != self._image:
-            if self._image_pinned:
-                return False
-            logger.warning(
-                "Adoptable container %s runs image %s, not the default docker_image %s — keeping the "
-                "existing sandbox", container_id[:12], actual_image, self._image)
-        return self._network or self._container_network_mode(container_id) == "none"
+        """Runtime half of cross-bucket adoption: the image must match exactly, pinned or not (a
+        per-task ``docker_image`` override must not run in the user's jail; the unpinned-flip
+        leniency lives in ``_replace_drifted_defaults``), and an air-gapped spawn adopts only a
+        ``none``-network container. Failed probes fail closed."""
+        return (self._container_image(container_id) == self._image
+                and (self._network or self._container_network_mode(container_id) == "none"))
 
     def _image_available_locally(self) -> bool:
         """True once ``self._image`` is in the local image store, pulling it when it is not. Called BEFORE a
@@ -1336,33 +1401,43 @@ class DockerEnvironment(BaseEnvironment):
         return any(p in output for p in self._NO_CONTAINER_PATTERNS)
 
     def _recreate_container(self) -> bool:
-        """Recreate a container removed out-of-band: label-based reuse first (another process
-        may have recreated it), else a fresh one from the saved image/run-args. False when
-        recovery fails so the caller surfaces the original error."""
-        logger.warning("Container %s appears to be gone — attempting recovery", (self._container_id or "")[:12])
+        """Recover a container stopped or removed out-of-band. The mount gate runs first, so nothing
+        below starts a second holder of a jail another process already brought back up: it adopts
+        that container or refuses. Then our previous container is restarted — after a daemon
+        restart it still exists, stopped, and may be a jail adopted under another task's labels that
+        the label search would miss. Only then label-based reuse (another process may have
+        recreated it), else a fresh one from the saved image/run-args. False when recovery fails
+        so the caller surfaces the original error."""
+        prev = self._container_id
+        logger.warning("Container %s appears to be gone — attempting recovery", (prev or "")[:12])
         self._container_id = None
+        try:
+            self._adopt_or_refuse_mount_conflict(replace=False)
+        except RuntimeError as e:
+            logger.error("Recovery refused: %s", e)
+            return False
 
-        existing = self._find_reusable_container(
-            self._labels.get("hermes-task-id", ""),
-            self._labels.get("hermes-profile", ""),
-            self._labels.get(_EGRESS_LABEL_KEY, "off"))
-        if existing is not None:
-            cid, state = existing
-            if state == "running":
-                self._container_id = cid
-                logger.info("Recovery: reusing running container %s", cid[:12])
-            elif (err := self._start_container(cid)) is None:
-                self._container_id = cid
-                logger.info("Recovery: restarted container %s", cid[:12])
+        if not self._container_id and prev:
+            if (err := self._start_container(prev)) is None:
+                self._container_id = prev
+                logger.info("Recovery: restarted container %s", prev[:12])
             else:
-                logger.warning("Recovery: failed to start container %s: %s", cid[:12], err)
-
+                logger.info("Recovery: container %s cannot be restarted: %s", prev[:12], err)
         if not self._container_id:
-            try:
-                self._adopt_or_refuse_mount_conflict(replace=False)
-            except RuntimeError as e:
-                logger.error("Recovery: %s", e)
-                return False
+            existing = self._find_reusable_container(
+                self._labels.get("hermes-task-id", ""),
+                self._labels.get("hermes-profile", ""),
+                self._labels.get(_EGRESS_LABEL_KEY, "off"))
+            if existing is not None:
+                cid, state = existing
+                if state == "running":
+                    self._container_id = cid
+                    logger.info("Recovery: reusing running container %s", cid[:12])
+                elif (err := self._start_container(cid)) is None:
+                    self._container_id = cid
+                    logger.info("Recovery: restarted container %s", cid[:12])
+                else:
+                    logger.warning("Recovery: failed to start container %s: %s", cid[:12], err)
         if not self._container_id:
             if not self._image:
                 logger.error("Recovery: no saved image name, cannot recreate container")

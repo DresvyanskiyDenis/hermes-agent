@@ -27,9 +27,11 @@ def _jail_candidate(tmp_path, *, profile="bot_1", egress="off", image="python:3.
         "image": image, "net": net}
 
 
-def _mock_jail_guard(monkeypatch, tmp_path, candidates, *, conflict_ps_rc=0, image_available=True):
-    """Label-reuse probe always misses; the conflict probe lists *candidates* (cid -> answers,
-    ``"raw"`` overriding the labels+mounts inspect output). Returns the captured argv list."""
+def _mock_jail_guard(monkeypatch, tmp_path, candidates, *, conflict_ps_rc=0, image_available=True,
+                     labeled=None, rm_rc=0):
+    """Label-reuse probe misses unless *labeled* (``(cid, state)``) names a by-label hit; the conflict
+    probe lists *candidates* (cid -> answers, ``"raw"`` overriding the labels+mounts inspect output).
+    ``docker rm`` exits *rm_rc*. Returns the captured argv list."""
     monkeypatch.setenv("TERMINAL_SANDBOX_DIR", str(tmp_path / "sandboxes"))
     # pytest's tmp_path sits under the system tempdir, whose mounts count as volatile and would
     # hide every per-task sandbox dir from the guard; point the process tempdir elsewhere.
@@ -55,7 +57,7 @@ def _mock_jail_guard(monkeypatch, tmp_path, candidates, *, conflict_ps_rc=0, ima
         if sub == "version":
             return done(out="Docker version")
         if sub == "ps" and "-a" in cmd:
-            return done()  # label-keyed reuse misses: the task bucket differs
+            return done(out="\t".join(labeled) if labeled else "")  # usually a miss: the bucket differs
         if sub == "ps":
             assert "status=running" in cmd and not any("hermes-task-id=" in a for a in cmd)
             return done(conflict_ps_rc, "\n".join(candidates))
@@ -63,6 +65,8 @@ def _mock_jail_guard(monkeypatch, tmp_path, candidates, *, conflict_ps_rc=0, ima
             return done(out=_inspect(candidates[cmd[-1]], cmd[cmd.index("--format") + 1]))
         if sub == "run":
             return done(out="fresh-cid\n")
+        if sub == "rm":
+            return done(rm_rc)
         if sub == "image" and cmd[2] == "inspect":
             return done(0 if image_available else 1, out="sha256:img\n")
         if sub == "pull":
@@ -169,15 +173,20 @@ def test_jail_guard_two_adoptables_take_first_and_warn_second(monkeypatch, tmp_p
     assert "cidB" in caplog.text
 
 
-def test_jail_guard_unpinned_image_mismatch_adopts(monkeypatch, tmp_path, caplog):
-    """Keep-existing-sandbox policy, as label reuse applies to a default-image flip."""
-    calls = _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": _jail_candidate(tmp_path, image="other:tag")})
+@pytest.mark.parametrize("jail", ["/srv/jail", None], ids=["real-shared-refuses", "sandbox-only-proceeds"])
+def test_jail_guard_image_mismatch_never_adopts_across_buckets(monkeypatch, tmp_path, jail):
+    """Cross-bucket adoption needs the exact image, pinned or not: an RL rollout's per-task
+    ``docker_image`` override must not run inside the user's default jail. Over a real jail path
+    that is the leak class and refuses; with only per-task dirs a fresh container is correct."""
+    calls = _mock_jail_guard(monkeypatch, tmp_path,
+                             {"jail-cid": _jail_candidate(tmp_path, image="other:tag", jail=jail)})
 
-    with caplog.at_level(logging.WARNING, logger="tools.environments.docker"):
-        env = _jail_spawn(image_pinned=False)
-
-    assert env._container_id == "jail-cid" and not _docker_runs(calls)
-    assert "other:tag" in caplog.text
+    if jail:
+        with pytest.raises(RuntimeError, match="already bind-mounted read-write"):
+            _jail_spawn(image_pinned=False)
+        assert not _docker_runs(calls)
+    else:
+        assert _jail_spawn(image_pinned=False, volumes=[])._container_id == "fresh-cid"
 
 
 @pytest.mark.parametrize("theirs, ours", [
@@ -193,13 +202,27 @@ def test_jail_guard_per_task_buckets_coexist(monkeypatch, tmp_path, theirs, ours
     assert env._container_id == "fresh-cid" and _docker_runs(calls)
 
 
-def test_jail_guard_non_default_real_path_still_refuses(monkeypatch, tmp_path):
-    """No default side: never adoptable, but a shared real host path still refuses."""
+def test_jail_guard_non_default_real_path_overlap_warns_and_proceeds(monkeypatch, tmp_path, caplog):
+    """No default side is outside the leak class: two rollout buckets pointed at one real path
+    worked before the guard, so it only warns and gets a fresh container."""
     calls = _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": _jail_candidate(tmp_path, task="rollout:seven")})
 
-    with pytest.raises(RuntimeError, match="already bind-mounted read-write"):
-        _jail_spawn()
-    assert not _docker_runs(calls)
+    with caplog.at_level(logging.WARNING, logger="tools.environments.docker"):
+        env = _jail_spawn()
+
+    assert env._container_id == "fresh-cid" and _docker_runs(calls)
+    assert "/srv/jail" in caplog.text
+
+
+def test_jail_guard_default_vs_bucket_divergent_binds_refuses(monkeypatch, tmp_path):
+    """The narrowed refusal still closes the leak class: a default spawn whose real jail path a
+    differently-mounted rollout container already holds refuses instead of double-mounting it."""
+    calls = _mock_jail_guard(monkeypatch, tmp_path, {"leak-cid": _jail_candidate(
+        tmp_path, task="rollout:seven", extra=[("/srv/x", "/x")])})
+
+    with pytest.raises(RuntimeError, match="/srv/jail"):
+        _jail_spawn(task_id="default")
+    assert not [c for c in calls if c[1] in ("rm", "run")]
 
 
 def test_jail_guard_default_spawn_adopts_forge_jail(monkeypatch, tmp_path):
@@ -225,19 +248,90 @@ def test_jail_guard_default_config_drift_replaces(monkeypatch, tmp_path, candida
     assert env._container_id == "fresh-cid" and _docker_runs(calls)
 
 
-def test_jail_guard_drift_keeps_old_container_when_image_unavailable(monkeypatch, tmp_path):
-    """A replacement image that cannot be pulled must not cost the profile its only sandbox:
-    the stale-but-working container is kept and attached, mirroring _attach_existing_container's
-    pinned-image branch (removing first would throw away its writable layer for nothing)."""
+def test_jail_guard_egress_drift_refuses_when_image_unavailable(monkeypatch, tmp_path):
+    """An unpullable replacement keeps the old container only for pure image drift: attaching a
+    pre-egress container would bypass the firewall, so egress drift refuses (nothing removed)."""
     calls = _mock_jail_guard(monkeypatch, tmp_path,
                              {"jail-cid": _jail_candidate(tmp_path, egress="eg123")},
                              image_available=False)
 
+    with pytest.raises(RuntimeError, match="jail-cid"):
+        _jail_spawn(task_id="default")
+    assert not [c for c in calls if c[1] in ("rm", "run")]
+
+
+def test_jail_guard_unpinned_image_flip_keeps_existing_sandbox(monkeypatch, tmp_path, caplog):
+    """Bind-equal, egress-equal, only the unpinned default image moved: keep the sandbox someone
+    has state in (``_attach_existing_container``'s policy), even with the new image unpullable."""
+    calls = _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": _jail_candidate(tmp_path, image="other:tag")},
+                             image_available=False)
+
+    with caplog.at_level(logging.WARNING, logger="tools.environments.docker"):
+        env = _jail_spawn(task_id="default", image_pinned=False)
+
+    assert env._container_id == "jail-cid"
+    assert not [c for c in calls if c[1] in ("rm", "run")]
+    assert "other:tag" in caplog.text and "python:3.11" in caplog.text
+
+
+def test_jail_guard_default_bind_divergence_refuses(monkeypatch, tmp_path):
+    """Replace needs bind-model equality: a default sibling with other volumes may hold a live
+    sandbox, so a mount divergence refuses rather than deleting it."""
+    calls = _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": _jail_candidate(
+        tmp_path, extra=[("/srv/extra", "/data")])})
+
+    with pytest.raises(RuntimeError, match="/srv/jail"):
+        _jail_spawn(task_id="default")
+    assert not [c for c in calls if c[1] in ("rm", "run")]
+
+
+def test_jail_guard_refusal_names_literal_sandbox_path(monkeypatch, tmp_path):
+    """With no real path shared, a default↔default refusal names the sandbox dir both buckets
+    share as the host path it is, never the internal ``<sandbox>`` token."""
+    _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": _jail_candidate(
+        tmp_path, jail=None, extra=[("/srv/extra", "/data")])})
+
+    with pytest.raises(RuntimeError) as err:
+        _jail_spawn(task_id="default", volumes=[])
+    assert "<sandbox>" not in str(err.value)
+    assert os.path.realpath(tmp_path / "sandboxes" / "docker" / "default" / "home") in str(err.value)
+
+
+def test_jail_guard_failed_removal_refuses(monkeypatch, tmp_path):
+    """A drift replacement whose ``docker rm`` fails must not run alongside the survivor."""
+    calls = _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": _jail_candidate(tmp_path, egress="eg123")},
+                             rm_rc=1)
+
+    with pytest.raises(RuntimeError, match="Could not remove .*jail-cid"):
+        _jail_spawn(task_id="default")
+    assert not _docker_runs(calls)
+
+
+def test_jail_guard_stopped_label_hit_adopts_running_twin(monkeypatch, tmp_path):
+    """Daemon restart, forge recovered first: starting the stopped default jail would make two
+    running holders of one path. The by-label start is mount-gated and adopts the running twin."""
+    calls = _mock_jail_guard(monkeypatch, tmp_path, {"forge-cid": _jail_candidate(tmp_path, task="profile:forge")},
+                             labeled=("stopped-cid", "exited"))
+
     env = _jail_spawn(task_id="default")
 
-    assert not [c for c in calls if c[1] == "rm"], "a stale container stays while its replacement cannot be pulled"
-    assert not _docker_runs(calls)
+    assert env._container_id == "forge-cid"
+    assert not [c for c in calls if c[1] in ("start", "run")]
+
+
+def test_jail_guard_recovery_restarts_adopted_jail(monkeypatch, tmp_path):
+    """An adopter's recovery restarts the jail it adopted — whose default labels its own label
+    search misses — instead of ``docker run``-ing a duplicate on the jail path."""
+    candidates = {"jail-cid": _jail_candidate(tmp_path)}
+    calls = _mock_jail_guard(monkeypatch, tmp_path, candidates)
+    env = _jail_spawn()
+    assert env._container_id == "jail-cid" and env._labels["hermes-task-id"] != "default"
+    candidates.clear()  # the daemon restarted: the jail exists, stopped
+
+    assert env._recreate_container() is True
     assert env._container_id == "jail-cid"
+    assert ["/usr/bin/docker", "start", "jail-cid"] in calls
+    assert not _docker_runs(calls)
 
 
 def test_jail_guard_drift_replacement_waits_for_refusal(monkeypatch, tmp_path):
@@ -302,3 +396,13 @@ def test_jail_guard_parse_mount_pair_args():
     assert has_tmpfs is False  # hardening tmpfs every hermes container carries
     assert docker_env._parse_mount_pair_args(["--tmpfs", "/root:rw,exec,size=1g"])[1] is True
     assert docker_env._parse_mount_pair_args(["--mount", "type=tmpfs,destination=/root"])[1] is True
+
+
+def test_jail_guard_parse_mount_pair_args_joined_flags_and_named_volumes():
+    parse = docker_env._parse_mount_pair_args
+
+    assert parse(["--volume=/a:/x", "--mount=type=bind,source=/b,target=/y,ro", "--tmpfs=/root"]) == parse(
+        ["--volume", "/a:/x", "--mount", "type=bind,source=/b,target=/y,ro", "--tmpfs", "/root"])
+    assert parse(["-v/a:/x"]) == parse(["-v", "/a:/x"]) == ([("/a", "/x", True)], False)
+    # ``docker inspect`` lists only binds; a named volume in the spawn's model would never compare equal.
+    assert parse(["-v", "named:/x", "-v", "./rel:/y"])[0] == [("./rel", "/y", True)]
