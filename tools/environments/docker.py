@@ -152,8 +152,13 @@ def _is_volatile_mount_spec(spec: str) -> bool:
         return False
 
 
-def _reuse_environment_fingerprint(*, image: str, mount_args: list[str], hermes_home: str) -> str:
-    """Hash immutable configuration so reuse cannot silently attach to stale mounts.
+def _reuse_environment_fingerprint(
+    *, image: str, mount_args: list[str], hermes_home: str, egress: str | None = None, sandbox: str = "",
+    shared_key: str = "",
+) -> str:
+    """The container's identity: its name (``_canonical_container_name``), reuse, recovery and drift
+    all derive from this one hash of the immutable configuration, so a changed config is a new
+    container by construction.
 
     Hash requested values rather than exposing profile paths and volume sources in labels.
     Keep mount order: later arguments can override earlier mount destinations.
@@ -162,16 +167,33 @@ def _reuse_environment_fingerprint(*, image: str, mount_args: list[str], hermes_
     it made the label differ across processes and cross-process container reuse never
     matched for users with any symlink under ``skills/``. The container path stays in the
     hash, so moving where that mount lands still forces a fresh container.
+
+    *egress* is the egress posture label: its proxy env and CA mount are immutable after creation.
+    ``None`` hashes the pre-canonical-name payload, kept only to find legacy containers.
+    *sandbox* is the task bucket of a tmpfs sandbox, which has no host path to carry it.
+    *shared_key*: explicit sharing opts into the first creator's settings, so only the key and the
+    egress posture identify the container.
     """
-    normalized_home = os.path.normcase(os.path.abspath(os.path.expanduser(hermes_home)))
-    canonical_mounts = [
-        (f"<volatile-tempdir-mount>:{spec.split(':', 1)[1]}"
-         if _is_volatile_mount_spec(spec) else spec)
-        for spec in mount_args]
-    payload = json.dumps(
-        {"image": image, "mount_args": canonical_mounts, "hermes_home": normalized_home},
-        sort_keys=True, separators=(",", ":"))
+    if shared_key:
+        identity = {"shared_key": shared_key, "egress": egress}
+    else:
+        normalized_home = os.path.normcase(os.path.abspath(os.path.expanduser(hermes_home)))
+        canonical_mounts = [
+            (f"<volatile-tempdir-mount>:{spec.split(':', 1)[1]}"
+             if _is_volatile_mount_spec(spec) else spec)
+            for spec in mount_args]
+        identity = {"image": image, "mount_args": canonical_mounts, "hermes_home": normalized_home}
+        if egress is not None:
+            identity["egress"] = egress
+        if sandbox:
+            identity["sandbox"] = sandbox
+    payload = json.dumps(identity, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+
+def _canonical_container_name(fingerprint: str) -> str:
+    """One name per identity: ``docker run --name`` is the daemon's atomic duplicate test."""
+    return f"hermes-{fingerprint[:12]}"
 
 
 def reap_orphan_containers(
@@ -855,12 +877,15 @@ class DockerEnvironment(BaseEnvironment):
             "hermes-task-id": task_label,
             "hermes-profile": profile_name,
             _EGRESS_LABEL_KEY: egress_label}
-        # Explicit sharing opts into the first creator's settings. Otherwise,
-        # changed image/mount/home configuration must start a fresh container.
-        if not shared_container_key:
-            self._labels[_ENVIRONMENT_LABEL_KEY] = _reuse_environment_fingerprint(
-                image=image, mount_args=[*writable_args, *volume_args],
-                hermes_home=str(get_hermes_home()))
+        identity = dict(image=image, mount_args=[*writable_args, *volume_args], hermes_home=str(get_hermes_home()))
+        self._labels[_ENVIRONMENT_LABEL_KEY] = _reuse_environment_fingerprint(
+            **identity, egress=egress_label, sandbox="" if persistent_filesystem else task_label,
+            shared_key=shared_container_key)
+        # What pre-canonical-name processes labeled the same config with (none under a shared key).
+        self._legacy_fingerprint = None if shared_container_key else _reuse_environment_fingerprint(**identity)
+        # A session-scoped container (no cross-process persistence) is nobody else's to share.
+        self._name = (_canonical_container_name(self._labels[_ENVIRONMENT_LABEL_KEY]) if persist_across_processes
+                      else f"hermes-{uuid.uuid4().hex[:8]}")
         # Saved for container recreation on "No such container" recovery.
         self._image = image
         self._image_pinned = image_pinned
@@ -1323,7 +1348,7 @@ class DockerEnvironment(BaseEnvironment):
         """Start a fresh container and return its id. A failed ``docker run`` (exit 125, timeout
         mid-pull) can leave a "Created" orphan the exited-only reaper never catches, so it is
         removed by name before re-raising."""
-        container_name = f"hermes-{uuid.uuid4().hex[:8]}"
+        container_name = self._name
         run_cmd = self._run_command(container_name, cwd)
         logger.debug("Starting container: %s", ' '.join(run_cmd))
         try:
@@ -1549,8 +1574,8 @@ class DockerEnvironment(BaseEnvironment):
             "--filter", f"label=hermes-task-id={task_label}",
             "--filter", f"label=hermes-profile={profile_label}",
             "--filter", f"label={_EGRESS_LABEL_KEY}={egress_label}"]
-        if environment_label := self._labels.get(_ENVIRONMENT_LABEL_KEY):
-            filters.extend(["--filter", f"label={_ENVIRONMENT_LABEL_KEY}={environment_label}"])
+        if self._legacy_fingerprint:
+            filters.extend(["--filter", f"label={_ENVIRONMENT_LABEL_KEY}={self._legacy_fingerprint}"])
         result = _docker_query(
             [self._docker_exe, "ps", "-a", *filters, "--format", "{{.ID}}\t{{.State}}"], timeout=10,
             fail="docker ps probe failed: %s — will start a fresh container",
