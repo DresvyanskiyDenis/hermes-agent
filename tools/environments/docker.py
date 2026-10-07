@@ -650,10 +650,10 @@ def _canonical_bind_source(path: str, sandbox_root: str) -> str:
 def _split_joined_mount_flags(run_args: list[str]):
     """``--volume=x``, ``--mount=x``, ``--tmpfs=x``, ``-vx`` and ``-v=x`` as separate flag and value tokens."""
     for arg in run_args:
-        if arg.startswith(("--volume=", "--mount=", "--tmpfs=")):
+        if arg.startswith(("--volume=", "--mount=", "--tmpfs=", "-v=")):
             yield from arg.split("=", 1)
         elif arg.startswith("-v") and len(arg) > 2 and arg[2] != "-":
-            yield from ("-v", arg[2:].removeprefix("="))
+            yield from ("-v", arg[2:])
         else:
             yield arg
 
@@ -704,8 +704,8 @@ def _classify_jail_candidate(our_labels, ours, has_tmpfs, labels, theirs) -> tup
     and canonical bind models alone (runtime image/network checks are the caller's).
 
     ``same_jail``: adoptable modulo runtime — same profile, one side the ``default`` bucket, equal
-    binds that either share a real RW path or are both the default bucket (an exact-label twin with
-    no host volumes mounts only the sandbox dirs), same egress, no tmpfs spawn. ``verdict`` is the outcome
+    binds with a colliding RW path (for a default twin with no host volumes, only the sandbox dirs),
+    same egress, no tmpfs spawn. ``verdict`` is the outcome
     when it is NOT adopted, ``path`` the colliding RW source to name (a real one when any):
 
     - ``"replace"``: default↔default with equal binds — config evolution (egress/image/network).
@@ -728,7 +728,7 @@ def _classify_jail_candidate(our_labels, ours, has_tmpfs, labels, theirs) -> tup
         return False, None, None
     path = min(real_shared or colliding)
     jail_side = same_profile and (our_default or their_default)
-    same_jail = (jail_side and (bool(real_shared) or both_default) and theirs == ours and not has_tmpfs
+    same_jail = (jail_side and theirs == ours and not has_tmpfs
                  and labels.get(_EGRESS_LABEL_KEY) == our_labels[_EGRESS_LABEL_KEY])
     if both_default and theirs == ours:
         return same_jail, "replace", path
@@ -1105,11 +1105,11 @@ class DockerEnvironment(BaseEnvironment):
         Per running candidate (``_classify_jail_candidate``), in order:
 
         - ADOPT a same-profile, same-egress container whose binds equal ours modulo the sandbox
-          bucket and either share a real RW path or are both the default bucket, with the exact same
-          image and a compatible network, when either side is the ``default`` bucket: forge spawn vs
-          default jail, the reverse, or a default twin with no host volumes (another process of the
-          profile recreated the shared default jail). An image mismatch never adopts across buckets — a per-task image override must
-          not run inside the user's jail.
+          bucket and collide on a RW path, with the exact same image and a compatible network, when
+          either side is the ``default`` bucket: forge spawn vs default jail, the reverse, or a
+          default twin with no host volumes that another process of the profile recreated. An image
+          mismatch never adopts across buckets — a per-task image override must not run inside the
+          user's jail.
         - REPLACE (``docker rm -f``, then a fresh ``docker run``) a ``default`` container when ours
           is ``default`` too and its binds equal ours but it is not adoptable: genuine config
           evolution (egress, pinned image, network). Replace requires bind-model equality; a mount
@@ -1129,10 +1129,10 @@ class DockerEnvironment(BaseEnvironment):
 
         Probe-then-run is not atomic: this prevents or self-heals the sequential mis-spawn class
         (spawn/restart under a differing task bucket); simultaneous cold races remain possible and
-        each bucket keeps its own container until a restart re-runs the gate. *exclude* is never
-        adopted or refused (exec recovery's own previous container). A tmpfs /root cannot be proven equivalent to a bound one, so a
-        tmpfs spawn never adopts. A read-only side never conflicts. Probe failures proceed — this
-        must never brick startup."""
+        each bucket keeps its own container until a restart re-runs the gate. *exclude* (exec
+        recovery's previous container) is never adopted or refused. A tmpfs /root cannot be proven
+        equivalent to a bound one, so a tmpfs spawn never adopts. A read-only side never conflicts.
+        Probe failures proceed — this must never brick startup."""
         if not self._persist_across_processes:
             return False
         root = _persistent_sandbox_root()
@@ -1148,7 +1148,7 @@ class DockerEnvironment(BaseEnvironment):
         adopted = refusal = None
         replaceable: list[tuple[str, dict, str]] = []
         for cid in result.stdout.split():
-            if cid == exclude:
+            if exclude and exclude.startswith(cid):
                 continue
             candidate = self._inspect_jail_candidate(cid, root)
             if candidate is None:
@@ -1229,8 +1229,8 @@ class DockerEnvironment(BaseEnvironment):
             try:
                 run_capture([self._docker_exe, "rm", "-f", cid], timeout=30, check=True)
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
-                # A concurrent remover got there first: the container is gone, which is the goal.
-                if isinstance(e, subprocess.CalledProcessError) and "No such container" in (e.stderr or ""):
+                # Docker exits 0 here; engines that exit nonzero (podman: lowercase) report it in stderr.
+                if isinstance(e, subprocess.CalledProcessError) and "no such container" in (e.stderr or "").lower():
                     logger.debug("Stale container %s was already removed by another process", cid[:12])
                     continue
                 raise RuntimeError(
