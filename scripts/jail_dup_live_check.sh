@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Live-daemon repro for duplicate jail mounts (t_44fdd37a): a spawn under another task bucket
-# must adopt the running jail (A), a conflicting same-profile spawn must be refused (B), and the
-# reverse leak order must converge on one container (C). Touches only containers it created
+# Live-daemon repro for duplicate jail mounts (t_44fdd37a). Touches only containers it created
 # that mount a path under its own temp root. Exit: 0 pass, 1 fail, 77 skip.
+#   A: a spawn under another task bucket adopts the running default jail.
+#   B: a conflicting same-profile spawn sharing the jail path is refused.
+#   C: the reverse leak order (forge first, then default) converges on one container.
+#   D: per-task buckets sharing only sandbox dirs coexist (D1), a non-default spawn sharing a
+#      real jail path is still refused (D2), and default-bucket config drift replaces (D3).
 set -u
 cd "$(dirname "$0")/.."
 PY=${HERMES_PYTHON:-.venv/bin/python}
@@ -100,5 +103,35 @@ idD=$(spawn default "$C:/home/bot") || fail "scenario C default spawn crashed"
 same_container "$idF" "$idD" || fail "default got $idD, not the forge jail $idF"
 echo "PASS selfheal-default-adopts-leaked-forge-jail"
 assert_single_jail "$A" "$C"
+
+# D1: rollouts under one profile, no volumes — only per-task sandbox dirs, which coexist.
+export TERMINAL_SANDBOX_DIR=$T/sbxT2
+id3=$(spawn rollout:one) || fail "scenario D1 rollout:one spawn crashed"
+id4=$(spawn rollout:two) || fail "scenario D1 rollout:two spawn crashed"
+[ "${#id3}" = 64 ] && [ "${#id4}" = 64 ] && [ "$id3" != "$id4" ] \
+  || fail "rollouts must get fresh containers of their own, got $id3 / $id4"
+for id in "$id3" "$id4"; do
+  [ "$(docker inspect --format '{{.State.Running}}' "$id")" = true ] || fail "rollout container $id not running"
+done
+echo "PASS rollout-isolation"
+
+# D2: a non-default bucket sharing jail A's real path is refused (A's default side is theirs).
+out=$(spawn rollout:three "$A:/home/bot" "$B:/extra") || fail "scenario D2 spawn crashed: $out"
+case "$out" in
+  "REFUSED "*"already bind-mounted read-write"*) echo "PASS refuse-non-default-side" ;;
+  *) fail "expected a refusal, got: $out" ;;
+esac
+[ "$(holders "$B")" = 0 ] || fail "refused spawn left a container on $B"
+
+# D3: config evolution on the default bucket — an edited docker_volumes replaces the jail.
+export TERMINAL_SANDBOX_DIR=$T/sandboxes
+id5=$(spawn default "$A:/home/bot") || fail "scenario D3 default respawn crashed"
+same_container "$id1" "$id5" || fail "unchanged default config got $id5, not the jail $id1"
+id6=$(spawn default "$A:/home/bot" "$B:/extra") || fail "scenario D3 drifted spawn crashed: $id6"
+case "$id6" in REFUSED*) fail "config drift must replace, got: $id6" ;; esac
+same_container "$id1" "$id6" && fail "config drift reused the stale jail $id1"
+[ "$(holders "$A")" = 1 ] && [ "$(holders "$B")" = 1 ] || fail "replacement left $(holders "$A") holders of $A"
+echo "PASS replace-on-config-evolution"
+assert_single_jail "$A" "$B" "$C"
 
 echo "ALL PASS"

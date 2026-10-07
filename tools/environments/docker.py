@@ -1033,19 +1033,34 @@ class DockerEnvironment(BaseEnvironment):
             container_id[:12], task_label, profile_name, state)
         return True
 
-    def _adopt_or_refuse_mount_conflict(self) -> bool:
-        """Mount-aware fallback after a label-reuse miss, keeping the invariant: no two RUNNING
-        hermes-labeled containers with the same ``hermes-profile`` mount the same host path RW.
-        The environment label hashes the per-task sandbox dirs, so a spawn under another task
-        bucket (``profile:forge`` vs ``default``) never label-matches the jail it would double-mount.
+    def _adopt_or_refuse_mount_conflict(self, replace: bool = True) -> bool:
+        """Mount-aware fallback after a label-reuse miss. What is forbidden is double-mounting the
+        same REAL host path RW under conflicting sandbox identity; same-profile containers whose
+        only overlap is per-task sandbox dirs coexist by design (RL/benchmark rollouts and
+        per-session isolation run distinct task buckets under one profile on purpose). The
+        environment label hashes the per-task sandbox dirs, so a spawn under another task bucket
+        (``profile:forge`` vs ``default``) never label-matches the jail it would double-mount.
 
-        ADOPT a same-profile, same-egress running container whose binds equal ours modulo the
-        sandbox bucket, with a compatible image and network. REFUSE (``RuntimeError``) when a
-        same-profile one shares a RW host source but differs otherwise. Else PROCEED (``False``).
-        A tmpfs /root cannot be proven equivalent to a bound one, so a tmpfs spawn never adopts. Foreign-profile RW overlap only warns: profiles
-        sharing one jail path is outside the reuse design, and refusing would break legitimately
-        shared estate paths. A read-only side never conflicts. Probe failures proceed — this must
-        never brick startup."""
+        Per running candidate, in order:
+
+        - ADOPT a same-profile, same-egress container whose binds equal ours modulo the sandbox
+          bucket and include a real shared RW path, with a compatible image and network, when
+          either side is the ``default`` bucket: forge spawn vs default jail, or the reverse.
+        - REPLACE (``docker rm -f``, then a fresh ``docker run``) a ``default`` container when ours
+          is ``default`` too, shares any RW source and is not adoptable: changed egress, volumes or
+          pinned image. Same bucket means the same literal sandbox dirs, so a tokenized overlap is
+          real here. Matches ``_attach_existing_container``'s remove-and-recreate mismatch policy;
+          a refusal from another candidate wins, so nothing is removed while one would remain.
+          With ``replace=False`` (exec recovery, whose labels may predate the config change) it is
+          refused instead: a stale process must not remove the container its successor recreated.
+        - REFUSE (``RuntimeError``) a same-profile container sharing a real (non-``<sandbox>``) RW
+          host path: rollout:three vs a default jail on $A, other:forge vs other:quux on $A.
+        - Otherwise PROCEED (``False``): rollout:one vs rollout:two sharing only per-task dirs.
+
+        A tmpfs /root cannot be proven equivalent to a bound one, so a tmpfs spawn never adopts.
+        Foreign-profile real-path overlap only warns: profiles sharing one jail path is outside the
+        reuse design, and refusing would break legitimately shared estate paths. A read-only side
+        never conflicts. Probe failures proceed — this must never brick startup."""
         if not self._persist_across_processes:
             return False
         root = _persistent_sandbox_root()
@@ -1059,7 +1074,9 @@ class DockerEnvironment(BaseEnvironment):
             nonzero="docker ps mount-conflict probe returned %d: %s")
         if result is None:
             return False
+        our_default = self._labels["hermes-task-id"] == "default"
         adopted = refusal = None
+        replaceable: list[str] = []
         for cid in result.stdout.split():
             if cid == self._container_id:
                 continue
@@ -1068,8 +1085,14 @@ class DockerEnvironment(BaseEnvironment):
                 continue
             labels, theirs = candidate
             same_profile = labels.get("hermes-profile") == self._labels["hermes-profile"]
-            same_jail = (same_profile and theirs and theirs == ours and not has_tmpfs
-                         and labels.get(_EGRESS_LABEL_KEY) == self._labels[_EGRESS_LABEL_KEY])
+            their_default = labels.get("hermes-task-id") == "default"
+            shared_rw = [s for s, _, rw in theirs if rw and s in our_rw]
+            real_shared = [s for s in shared_rw if not s.startswith(_SANDBOX_TOKEN)]
+            # Per-task buckets are deliberate isolation; only the profile's canonical default
+            # container is a jail identity another bucket may re-join, and only over a real host
+            # path — with nothing real to double-mount, a fresh container is the correct outcome.
+            same_jail = (same_profile and (our_default or their_default) and real_shared and theirs == ours
+                         and not has_tmpfs and labels.get(_EGRESS_LABEL_KEY) == self._labels[_EGRESS_LABEL_KEY])
             if same_jail and adopted is not None:
                 logger.warning(
                     "Container %s duplicates adopted jail %s (same profile and mounts) — stale "
@@ -1078,9 +1101,13 @@ class DockerEnvironment(BaseEnvironment):
             if same_jail and self._runtime_adoptable(cid):
                 adopted = (cid, labels)
                 continue
-            # A real host path names the conflict better than a <sandbox> token.
-            shared = min((s for s, _, rw in theirs if rw and s in our_rw),
-                         key=lambda s: s.startswith(_SANDBOX_TOKEN), default=None)
+            if same_profile and our_default and their_default and shared_rw:
+                if replace:
+                    replaceable.append(cid)
+                    continue
+                shared = min(shared_rw)
+            else:
+                shared = min(real_shared, default=None)
             if shared is None:
                 continue
             if not same_profile:
@@ -1099,6 +1126,7 @@ class DockerEnvironment(BaseEnvironment):
                 "same host paths", cid[:12], labels.get("hermes-task-id"), self._labels["hermes-profile"],
                 self._task_id)
             return True
+        # Checked before any removal: replacing would still double-mount the refused path.
         if refusal is not None:
             cid, labels, source = refusal
             raise RuntimeError(
@@ -1107,6 +1135,15 @@ class DockerEnvironment(BaseEnvironment):
                 f"(task={labels.get('hermes-task-id')!r}, profile={labels.get('hermes-profile')!r}) with a "
                 "conflicting sandbox identity (egress/image/network/mounts). Stop or remove that "
                 "container, or spawn under a matching task identity to reuse it.")
+        for cid in replaceable:
+            logger.warning(
+                "Running default container %s shares this profile's jail mounts but its sandbox "
+                "configuration (egress/image/network/mounts) changed — removing it and starting "
+                "fresh (profile=%s)", cid[:12], self._labels["hermes-profile"])
+            try:
+                run_capture([self._docker_exe, "rm", "-f", cid], timeout=30)
+            except (subprocess.TimeoutExpired, OSError) as e:
+                logger.warning("Failed to remove mismatched container %s: %s", cid[:12], e)
         return False
 
     def _inspect_jail_candidate(self, container_id: str, sandbox_root: str):
@@ -1300,7 +1337,7 @@ class DockerEnvironment(BaseEnvironment):
 
         if not self._container_id:
             try:
-                self._adopt_or_refuse_mount_conflict()
+                self._adopt_or_refuse_mount_conflict(replace=False)
             except RuntimeError as e:
                 logger.error("Recovery: %s", e)
                 return False

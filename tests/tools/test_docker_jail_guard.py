@@ -12,13 +12,14 @@ from tools.environments.path_utils import sanitize_task_id_for_path
 
 
 def _jail_candidate(tmp_path, *, profile="bot_1", egress="off", image="python:3.11", net="default",
-                    task="default", extra=()):
-    """Inspect answers for a running persistent jail held under *task*'s sandbox bucket."""
+                    task="default", jail="/srv/jail", extra=()):
+    """Inspect answers for a running persistent jail held under *task*'s sandbox bucket
+    (``jail=None``: only the per-task sandbox dirs, the RL rollout / per-session shape)."""
     bucket = tmp_path / "sandboxes" / "docker" / sanitize_task_id_for_path(task)
     for sub in ("home", "workspace"):
         (bucket / sub).mkdir(parents=True, exist_ok=True)
     binds = [(str(bucket / "home"), "/root"), (str(bucket / "workspace"), "/workspace"),
-             ("/srv/jail", "/home/bot"), *extra]
+             *([(jail, "/home/bot")] if jail else []), *extra]
     return {
         "labels": {"hermes-agent": "1", "hermes-profile": profile, "hermes-task-id": task,
                    "hermes-egress": egress},
@@ -30,6 +31,10 @@ def _mock_jail_guard(monkeypatch, tmp_path, candidates, *, conflict_ps_rc=0):
     """Label-reuse probe always misses; the conflict probe lists *candidates* (cid -> answers,
     ``"raw"`` overriding the labels+mounts inspect output). Returns the captured argv list."""
     monkeypatch.setenv("TERMINAL_SANDBOX_DIR", str(tmp_path / "sandboxes"))
+    # pytest's tmp_path sits under the system tempdir, whose mounts count as volatile and would
+    # hide every per-task sandbox dir from the guard; point the process tempdir elsewhere.
+    (tmp_path / "proc-tmp").mkdir()
+    monkeypatch.setattr(docker_env.tempfile, "gettempdir", lambda: str(tmp_path / "proc-tmp"))
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "bot_1")
     monkeypatch.setattr(docker_env, "_readonly_skill_mount_args", lambda: [])
@@ -169,6 +174,77 @@ def test_jail_guard_unpinned_image_mismatch_adopts(monkeypatch, tmp_path, caplog
 
     assert env._container_id == "jail-cid" and not _docker_runs(calls)
     assert "other:tag" in caplog.text
+
+
+@pytest.mark.parametrize("theirs, ours", [
+    ("rollout:one", "rollout:two"), ("session:1", "session:2"), ("rollout:one", "default")])
+def test_jail_guard_per_task_buckets_coexist(monkeypatch, tmp_path, theirs, ours):
+    """RL/override rollouts and per-session isolation run distinct task buckets under one profile on
+    purpose: an overlap of only the (tokenized) per-task sandbox dirs neither adopts nor refuses —
+    not even for a default spawn, which would otherwise run inside the rollout's container."""
+    calls = _mock_jail_guard(monkeypatch, tmp_path, {"cid": _jail_candidate(tmp_path, task=theirs, jail=None)})
+
+    env = _jail_spawn(task_id=ours, volumes=[])
+
+    assert env._container_id == "fresh-cid" and _docker_runs(calls)
+
+
+def test_jail_guard_non_default_real_path_still_refuses(monkeypatch, tmp_path):
+    """No default side: never adoptable, but a shared real host path still refuses."""
+    calls = _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": _jail_candidate(tmp_path, task="rollout:seven")})
+
+    with pytest.raises(RuntimeError, match="already bind-mounted read-write"):
+        _jail_spawn()
+    assert not _docker_runs(calls)
+
+
+def test_jail_guard_default_spawn_adopts_forge_jail(monkeypatch, tmp_path):
+    """The default side may be ours: a default spawn re-joins a leaked ``profile:forge`` jail."""
+    calls = _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": _jail_candidate(tmp_path, task="profile:forge")})
+
+    assert _jail_spawn(task_id="default")._container_id == "jail-cid"
+    assert not _docker_runs(calls)
+
+
+@pytest.mark.parametrize("candidate_kw, spawn_kw", [
+    ({"egress": "eg123"}, {}),
+    ({"image": "other:tag"}, {"image_pinned": True}),
+], ids=["egress-change", "pinned-image-change"])
+def test_jail_guard_default_config_drift_replaces(monkeypatch, tmp_path, candidate_kw, spawn_kw):
+    """``hermes egress enable`` / a re-pinned image on a live profile: the stale default container
+    is removed and recreated, as label reuse does, instead of wedging every terminal call."""
+    calls = _mock_jail_guard(monkeypatch, tmp_path, {"jail-cid": _jail_candidate(tmp_path, **candidate_kw)})
+
+    env = _jail_spawn(task_id="default", **spawn_kw)
+
+    assert ["/usr/bin/docker", "rm", "-f", "jail-cid"] in calls
+    assert env._container_id == "fresh-cid" and _docker_runs(calls)
+
+
+def test_jail_guard_drift_replacement_waits_for_refusal(monkeypatch, tmp_path):
+    """A leaked same-profile holder of the jail path refuses before the default one is removed:
+    replacing would only double-mount the path the refusal names."""
+    candidates = {"jail-cid": _jail_candidate(tmp_path, egress="eg123"),
+                  "leak-cid": _jail_candidate(tmp_path, task="rollout:seven", extra=[("/srv/x", "/x")])}
+    calls = _mock_jail_guard(monkeypatch, tmp_path, candidates)
+
+    with pytest.raises(RuntimeError, match="leak-cid"):
+        _jail_spawn(task_id="default")
+    assert not [c for c in calls if c[1] in ("rm", "run")]
+
+
+def test_jail_guard_recovery_refuses_instead_of_replacing(monkeypatch, tmp_path):
+    """Exec recovery runs with labels from before the config change: removing the drifted default
+    container there would delete the one its successor just recreated, and the two would trade
+    removals. Recovery refuses (and fails the exec) instead."""
+    candidates = {}
+    calls = _mock_jail_guard(monkeypatch, tmp_path, candidates)
+    env = _jail_spawn(task_id="default")
+    candidates["new-cid"] = _jail_candidate(tmp_path, egress="eg123")
+
+    assert env._recreate_container() is False
+    assert not [c for c in calls if c[1] == "rm"]
+    assert len(_docker_runs(calls)) == 1
 
 
 def test_jail_guard_canonical_bind_source_tokenizes_sandbox_buckets(tmp_path):
