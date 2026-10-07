@@ -4,11 +4,20 @@ import json
 import logging
 import os
 import subprocess
+import sys
 
 import pytest
 
 from tools.environments import docker as docker_env
 from tools.environments.path_utils import sanitize_task_id_for_path
+
+
+@pytest.fixture(autouse=True)
+def _stable_tempdir(monkeypatch, tmp_path):
+    """pytest's tmp_path sits under the system tempdir, whose mounts count as volatile: that would
+    hide every per-task sandbox dir from the guard and blank them out of candidate fingerprints."""
+    (tmp_path / "proc-tmp").mkdir()
+    monkeypatch.setattr(docker_env.tempfile, "gettempdir", lambda: str(tmp_path / "proc-tmp"))
 
 
 def _jail_candidate(tmp_path, *, profile="bot_1", egress="off", image="python:3.11", net="default",
@@ -20,9 +29,13 @@ def _jail_candidate(tmp_path, *, profile="bot_1", egress="off", image="python:3.
         (bucket / sub).mkdir(parents=True, exist_ok=True)
     binds = [(str(bucket / "home"), "/root"), (str(bucket / "workspace"), "/workspace"),
              *([(jail, "/home/bot")] if jail else []), *extra]
+    # The fingerprint the matching spawn stamps: its sandbox binds, then its volumes, in argv order.
+    fingerprint = docker_env._reuse_environment_fingerprint(
+        image=image, mount_args=[arg for s, d in binds for arg in ("-v", f"{s}:{d}")],
+        hermes_home=str(tmp_path / "hermes-home"))
     return {
         "labels": {"hermes-agent": "1", "hermes-profile": profile, "hermes-task-id": task,
-                   "hermes-egress": egress},
+                   "hermes-egress": egress, "hermes-environment": fingerprint},
         "mounts": [{"Type": "bind", "Source": s, "Destination": d, "RW": True} for s, d in binds],
         "image": image, "net": net}
 
@@ -31,12 +44,10 @@ def _mock_jail_guard(monkeypatch, tmp_path, candidates, *, conflict_ps_rc=0, ima
                      labeled=None, rm_rc=0, rm_stderr=""):
     """Label-reuse probe misses unless *labeled* (``(cid, state)``) names a by-label hit; the conflict
     probe lists *candidates* (cid -> answers, ``"raw"`` overriding the labels+mounts inspect output).
-    ``docker rm`` exits *rm_rc* with *rm_stderr*. Returns the captured argv list."""
+    ``docker rm`` exits *rm_rc* with *rm_stderr*; every ``docker exec`` finds its container gone.
+    Returns the captured argv list."""
     monkeypatch.setenv("TERMINAL_SANDBOX_DIR", str(tmp_path / "sandboxes"))
-    # pytest's tmp_path sits under the system tempdir, whose mounts count as volatile and would
-    # hide every per-task sandbox dir from the guard; point the process tempdir elsewhere.
-    (tmp_path / "proc-tmp").mkdir()
-    monkeypatch.setattr(docker_env.tempfile, "gettempdir", lambda: str(tmp_path / "proc-tmp"))
+    monkeypatch.setattr(docker_env, "get_hermes_home", lambda: tmp_path / "hermes-home")
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "bot_1")
     monkeypatch.setattr(docker_env, "_readonly_skill_mount_args", lambda: [])
@@ -79,7 +90,14 @@ def _mock_jail_guard(monkeypatch, tmp_path, candidates, *, conflict_ps_rc=0, ima
             return done(0 if image_available else 1)
         return done()
 
+    def _exec(cmd, stdin_data=None, **kwargs):
+        calls.append(list(cmd))
+        return popen_bash([sys.executable, "-c", "print('Error response from daemon: No such container')\n"
+                                                 "raise SystemExit(1)"], stdin_data)
+
+    popen_bash = docker_env._popen_bash
     monkeypatch.setattr(docker_env.subprocess, "run", _run)
+    monkeypatch.setattr(docker_env, "_popen_bash", _exec)
     return calls
 
 
@@ -93,6 +111,19 @@ def _docker_runs(calls, *subs):
     return [c for c in calls if c[1] in (subs or ("run",))]
 
 
+def test_jail_guard_candidate_fixture_mirrors_spawn_labels(monkeypatch, tmp_path):
+    """A gate label the fixture omits makes every gate on it pass vacuously — how fingerprint-blind
+    default adoption stayed green. The identical twin carries exactly the spawn's labels."""
+    # Every label the adoption path in tools/environments/docker.py reads (ps filter, classifier).
+    gate_labels = {"hermes-agent", "hermes-profile", "hermes-task-id", "hermes-egress", "hermes-environment"}
+    _mock_jail_guard(monkeypatch, tmp_path, {})
+
+    labels = _jail_candidate(tmp_path)["labels"]
+
+    assert labels.keys() >= gate_labels
+    assert labels == _jail_spawn(task_id="default")._labels
+
+
 def test_jail_guard_adopts_when_only_task_bucket_differs(monkeypatch, tmp_path):
     """The live leak: a ``profile:forge`` spawn missed the ``default``-labeled jail and
     double-mounted /srv/jail. Identical mounts modulo the sandbox bucket must adopt it."""
@@ -100,7 +131,8 @@ def test_jail_guard_adopts_when_only_task_bucket_differs(monkeypatch, tmp_path):
 
     env = _jail_spawn()
 
-    assert "hermes-environment" in env._labels  # adoption must not require that label
+    # Required within one bucket, ignored across buckets: the hash embeds the bucket paths.
+    assert "hermes-environment" in env._labels
     assert env._container_id == "jail-cid"
     assert not _docker_runs(calls)
 
@@ -251,6 +283,22 @@ def test_jail_guard_default_config_drift_replaces(monkeypatch, tmp_path, candida
     assert env._container_id == "fresh-cid" and _docker_runs(calls)
 
 
+@pytest.mark.parametrize("candidate_kw, volumes", [
+    ({"jail": None}, ["cache:/data"]),
+    ({}, ["/srv/jail:/home/bot:z"]),
+], ids=["named-volume", "mount-option"])
+def test_jail_guard_default_twin_fingerprint_drift_replaces(monkeypatch, tmp_path, candidate_kw, volumes):
+    """A named volume or mount option is invisible to the bind model, so the stale default twin is
+    bind- and egress-equal; only its environment fingerprint differs. Adopting it would silently
+    drop the new config, so it is replaced."""
+    calls = _mock_jail_guard(monkeypatch, tmp_path, {"twin-cid": _jail_candidate(tmp_path, **candidate_kw)})
+
+    env = _jail_spawn(task_id="default", volumes=volumes)
+
+    assert ["/usr/bin/docker", "rm", "-f", "twin-cid"] in calls
+    assert env._container_id == "fresh-cid" and _docker_runs(calls)
+
+
 def test_jail_guard_egress_drift_refuses_when_image_unavailable(monkeypatch, tmp_path):
     """An unpullable replacement keeps the old container only for pure image drift: attaching a
     pre-egress container would bypass the firewall, so egress drift refuses (nothing removed)."""
@@ -359,20 +407,57 @@ def test_jail_guard_drift_replacement_waits_for_refusal(monkeypatch, tmp_path):
     assert not _docker_runs(calls, "rm", "run")
 
 
-def test_jail_guard_recovery_refuses_drifted_twin_and_restores_prev(monkeypatch, tmp_path):
+@pytest.mark.parametrize("candidate_kw, volumes", [
+    ({"egress": "eg123"}, ["/srv/jail:/home/bot"]),
+    ({"jail": None}, ["cache:/data"]),
+], ids=["egress", "fingerprint"])
+def test_jail_guard_recovery_refuses_drifted_twin_and_restores_prev(monkeypatch, tmp_path, candidate_kw, volumes):
     """Exec recovery runs with labels from before the config change: removing the drifted default
     container there would delete the one its successor just recreated, and the two would trade
     removals. Recovery refuses (and fails the exec) instead, keeping the gone id so the next exec
     retries recovery rather than asserting "Container not started"."""
     candidates = {}
     calls = _mock_jail_guard(monkeypatch, tmp_path, candidates)
-    env = _jail_spawn(task_id="default")
+    env = _jail_spawn(task_id="default", volumes=volumes)
     prev_id = env._container_id
-    candidates["new-cid"] = _jail_candidate(tmp_path, egress="eg123")
+    candidates["new-cid"] = _jail_candidate(tmp_path, **candidate_kw)
 
     assert env._recreate_container() is False
     assert env._container_id == prev_id
     assert not _docker_runs(calls, "rm")
+    assert len(_docker_runs(calls)) == 1
+
+
+def test_jail_guard_refused_recovery_retries_on_next_exec(monkeypatch, tmp_path):
+    """The kept gone id makes the next exec fail as container-gone and run recovery again."""
+    candidates = {}
+    calls = _mock_jail_guard(monkeypatch, tmp_path, candidates)
+    env = _jail_spawn(task_id="default", volumes=["cache:/data"])
+    prev_id = env._container_id
+    candidates["twin-cid"] = _jail_candidate(tmp_path, jail=None)
+    conflict_probes = lambda: len([c for c in calls if c[1] == "ps" and "status=running" in c])
+    before = conflict_probes()
+
+    env.execute("true")
+    assert conflict_probes() == before + 1
+    result = env.execute("true")
+
+    assert conflict_probes() == before + 2
+    assert env._container_id == prev_id and result["returncode"] != 0
+
+
+def test_jail_guard_recovery_skips_gone_container_and_adopts_other_twin(monkeypatch, tmp_path):
+    """A gone container can still be listed while it dies: recovery must not re-adopt the id whose
+    exec just failed, but the other exact twin."""
+    candidates = {}
+    calls = _mock_jail_guard(monkeypatch, tmp_path, candidates)
+    env = _jail_spawn(task_id="default", volumes=[])
+    assert env._container_id == "fresh-cid"
+    candidates.update({"fresh-cid": _jail_candidate(tmp_path, jail=None),
+                       "twin-cid": _jail_candidate(tmp_path, jail=None)})
+
+    assert env._recreate_container() is True
+    assert env._container_id == "twin-cid"
     assert len(_docker_runs(calls)) == 1
 
 

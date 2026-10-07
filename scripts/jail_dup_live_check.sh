@@ -12,6 +12,8 @@
 #   E2: exec recovery inside a live process restarts its own (adopted, foreign-labeled) container.
 #   F: two envs share one default jail with no host volumes (A-E all carry a real jail bind);
 #      after an out-of-band `docker rm` the first recreates it and the second's recovery adopts it.
+#   G: a default respawn that adds a named volume (invisible to the bind model, only its environment
+#      fingerprint differs) replaces the running default container instead of adopting it.
 set -u
 cd "$(dirname "$0")/.."
 PY=${HERMES_PYTHON:-.venv/bin/python}
@@ -38,6 +40,7 @@ cleanup() {
     docker inspect --format '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' "$id" 2>/dev/null \
       | grep -q "^$T/" && docker rm -f "$id" >/dev/null
   done <"$CREATED_IDS"
+  docker volume rm jaildup_g_vol >/dev/null 2>&1
   # The containers ran as root and wrote into their bind-mounted sandbox dirs.
   rm -rf "$T" 2>/dev/null || { docker run --rm -v "$T:/t" "$IMAGE" find /t -mindepth 1 -delete; rm -rf "$T"; }
   exit "$rc"
@@ -203,5 +206,17 @@ printf '%s\n' "$idA" "$idB" >>"$CREATED_IDS"
 same_container "$idA" "$idB" || fail "B recovered into $idB, not A's recreated jail $idA: $out"
 echo "PASS no-host-volume-default-twin-adopts"
 assert_single_jail "$T/sbxF/docker/default/home" "$T/sbxF/docker/default/workspace"
+
+# G: A-F differ only in binds. A named volume is invisible to the bind model, so only the
+# environment fingerprint tells this default twin is stale: adopting it would drop the volume.
+export TERMINAL_SANDBOX_DIR=$T/sbxG
+idC=$(spawn default) || fail "scenario G default spawn crashed"
+idG=$(spawn default jaildup_g_vol:/data) || fail "scenario G drifted spawn crashed: $idG"
+[ "${#idG}" = 64 ] && [ "$idG" != "$idC" ] || fail "drifted default must replace $idC with a fresh container, got: $idG"
+[ "$(docker inspect --format '{{.State.Running}}' "$idC" 2>/dev/null)" = true ] && fail "stale default $idC still running"
+docker inspect --format '{{range .Mounts}}{{.Type}}:{{.Destination}}{{"\n"}}{{end}}' "$idG" | grep -qx volume:/data \
+  || fail "replacement $idG does not carry the named volume"
+echo "PASS default-fingerprint-drift-replaces"
+assert_single_jail "$T/sbxG/docker/default/home"
 
 echo "ALL PASS"
