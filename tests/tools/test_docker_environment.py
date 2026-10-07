@@ -813,12 +813,12 @@ def test_container_name_follows_environment_fingerprint(monkeypatch, tmp_path, c
 
     def used_names():
         looked_up = {cmd[-1] for cmd, _ in calls if isinstance(cmd, list) and cmd[1:4] == ["inspect", "--type", "container"]}
-        spawned = {cmd[cmd.index("--name") + 1] for cmd, _ in calls if isinstance(cmd, list) and cmd[1] == "run"}
-        return looked_up, spawned
+        run_argv = _run_args_from_calls(calls)
+        return looked_up, run_argv[run_argv.index("--name") + 1]
 
     config = {"image": "python:3.11", "volumes": ["volume-a:/workspace"]}
     original = _make_dummy_env(**config)
-    assert used_names() == ({original._name}, {original._name})
+    assert used_names() == ({original._name}, original._name)
     calls.clear()
     assert _make_dummy_env(**config)._name == original._name
 
@@ -829,11 +829,11 @@ def test_container_name_follows_environment_fingerprint(monkeypatch, tmp_path, c
     calls.clear()
     env = _make_dummy_env(**config)
     assert env._name != original._name
-    assert used_names() == ({env._name}, {env._name})
+    assert used_names() == ({env._name}, env._name)
 
     calls.clear()
     assert env._recreate_container()
-    assert used_names() == ({env._name}, {env._name})
+    assert used_names() == ({env._name}, env._name)
 
 
 def test_shared_container_key_replaces_profile_identity(monkeypatch, tmp_path):
@@ -1177,9 +1177,14 @@ def test_reuse_starts_stopped_container_before_attaching(monkeypatch):
     assert not run_invocations, "should not docker run when reusing an exited container"
 
 
-def test_failed_docker_run_cleans_up_orphaned_container(monkeypatch):
-    """When ``docker run`` fails (e.g. exit 125), the partially-created
-    container must be removed by name.
+@pytest.mark.parametrize("failure", [
+    subprocess.CalledProcessError(125, "docker run", output="", stderr="docker: Error response from daemon"),
+    # TimeoutExpired carries bytes even under text=True; it must not trip the "already in use" check.
+    subprocess.TimeoutExpired("docker run", 120, stderr=b"Pulling fs layer"),
+], ids=["exit-125", "timeout-mid-pull"])
+def test_failed_docker_run_cleans_up_orphaned_container(monkeypatch, failure):
+    """When ``docker run`` fails (exit 125, or a timeout on a slow image pull), the
+    partially-created container must be removed by name.
 
     Docker can create the container object before failing to start it,
     leaving a stale ``Created`` container. The exited-only orphan reaper
@@ -1197,65 +1202,22 @@ def test_failed_docker_run_cleans_up_orphaned_container(monkeypatch):
             sub = cmd[1]
             if sub == "version":
                 return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
-            if sub == "ps":
-                # No reusable container -> fall through to a fresh `docker run`.
-                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
             if sub == "run":
                 run_names.append(cmd[cmd.index("--name") + 1])
-                raise subprocess.CalledProcessError(
-                    125, cmd, output="", stderr="docker: Error response from daemon"
-                )
+                raise failure
             if sub == "rm":
                 cleanup_calls.append(list(cmd))
-                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        # No container by name or label -> fall through to a fresh `docker run`.
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(docker_env.subprocess, "run", _run)
 
-    with pytest.raises(subprocess.CalledProcessError):
+    with pytest.raises(type(failure)):
         _make_dummy_env()
 
-    assert len(cleanup_calls) == 1, "docker rm should be called once for the orphaned container"
     # Plain rm by the canonical name: the daemon refuses it if a sibling's running container holds it.
     assert re.fullmatch(r"hermes-[0-9a-f]{12}", run_names[0])
-    assert cleanup_calls[0] == ["/usr/bin/docker", "rm", run_names[0]]
-
-
-def test_docker_run_timeout_cleans_up_orphaned_container(monkeypatch):
-    """When ``docker run`` times out (e.g. slow image pull), the
-    partially-created container must be removed. Salvage of #7440
-    (@Tranquil-Flow); regression for #7439.
-    """
-    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
-    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
-
-    cleanup_calls, run_names = [], []
-
-    def _run(cmd, **kwargs):
-        if isinstance(cmd, list) and len(cmd) >= 2:
-            sub = cmd[1]
-            if sub == "version":
-                return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
-            if sub == "ps":
-                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-            if sub == "run":
-                run_names.append(cmd[cmd.index("--name") + 1])
-                raise subprocess.TimeoutExpired(cmd, 120)
-            if sub == "rm":
-                cleanup_calls.append(list(cmd))
-                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(docker_env.subprocess, "run", _run)
-
-    with pytest.raises(subprocess.TimeoutExpired):
-        _make_dummy_env()
-
-    assert len(cleanup_calls) == 1, "docker rm should be called once for the orphaned container"
-    # Plain rm by the canonical name: the daemon refuses it if a sibling's running container holds it.
-    assert re.fullmatch(r"hermes-[0-9a-f]{12}", run_names[0])
-    assert cleanup_calls[0] == ["/usr/bin/docker", "rm", run_names[0]]
-
+    assert cleanup_calls == [["/usr/bin/docker", "rm", run_names[0]]]
 
 
 

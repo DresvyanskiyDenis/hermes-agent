@@ -120,8 +120,8 @@ def _get_active_profile_name() -> str:
 def _container_identity(shared_key: str = "") -> str:
     """Profile label used for container reuse and orphan reaping. Profiles are isolated by default; an
     explicit shared key lets trusted profiles share one Docker identity. Label sanitization is lossy
-    and reuse is label-keyed, so a digest of the raw key disambiguates colliding keys. Plain profile
-    names keep their historical un-suffixed labels."""
+    and reaping (and legacy-container lookup) is label-keyed, so a digest of the raw key disambiguates
+    colliding keys. Plain profile names keep their historical un-suffixed labels."""
     if not shared_key:
         return _sanitize_label_value(_get_active_profile_name())
     digest = hashlib.sha256(shared_key.encode("utf-8")).hexdigest()[:12]
@@ -141,7 +141,11 @@ def _is_volatile_mount_spec(spec: str) -> bool:
     if spec in ("-v", "--mount") or ":" not in spec:
         return False  # the flag element itself, or a non-bind arg (tmpfs modes etc.)
     parsed = _split_volume_spec(spec)
-    source = parsed[0] if parsed is not None else spec.split(":", 1)[0]
+    return _is_process_tempdir(parsed[0] if parsed is not None else spec.split(":", 1)[0])
+
+
+def _is_process_tempdir(source: str) -> bool:
+    """True when host path *source* sits under this process's tempdir."""
     if _is_windows_drive_path(source):
         return False  # drive-letter hosts can never be the POSIX process tempdir
     try:
@@ -649,9 +653,9 @@ def _persistent_sandbox_root() -> str:
 
 
 def _split_joined_mount_flags(run_args: list[str]):
-    """``--volume=x``, ``--mount=x``, ``--tmpfs=x``, ``-vx`` and ``-v=x`` as separate flag and value tokens."""
+    """``--volume=x``, ``--mount=x``, ``-vx`` and ``-v=x`` as separate flag and value tokens."""
     for arg in run_args:
-        if arg.startswith(("--volume=", "--mount=", "--tmpfs=", "-v=")):
+        if arg.startswith(("--volume=", "--mount=", "-v=")):
             yield from arg.split("=", 1)
         elif arg.startswith("-v") and len(arg) > 2 and arg[2] != "-":
             yield from ("-v", arg[2:])
@@ -690,8 +694,8 @@ def _shared_rw_sources(binds, sandbox_root: str) -> set[str]:
     (config drift deliberately starts the new container beside the stale one there) and per-process
     tempdir sources (the symlink-safe skills copy) are random per process, so both are dropped."""
     sources = set()
-    for source, dest, rw in binds:
-        if not rw or _is_volatile_mount_spec(f"{source}:{dest}"):
+    for source, _dest, rw in binds:
+        if not rw or _is_process_tempdir(source):
             continue
         source = _host_path_key(os.path.expanduser(source))
         if os.path.exists(source):
@@ -744,7 +748,6 @@ class DockerEnvironment(BaseEnvironment):
         # Set by terminal_tool._create_environment for session-scoped containers
         # (docker + container_persistent: false): removed at session close/idle timeout.
         self._session_scoped = False
-        self._task_id = task_id
         self._forward_env = _normalize_forward_env_names(forward_env)
         self._env = _normalize_env_dict(env)
         self._init_unset_passthrough_names: tuple[str, ...] = ()
@@ -807,15 +810,14 @@ class DockerEnvironment(BaseEnvironment):
         # derived from, captured at start and never changed for the container's lifetime.
         # Egress posture is a fingerprint input and also its own label for operators.
         profile_name = _container_identity(shared_container_key)
-        task_label = _sanitize_label_value(task_id)
         self._labels = {
             "hermes-agent": "1",
-            "hermes-task-id": task_label,
+            "hermes-task-id": _sanitize_label_value(task_id),
             "hermes-profile": profile_name,
             _EGRESS_LABEL_KEY: egress_label}
         identity = dict(image=image, mount_args=[*writable_args, *volume_args], hermes_home=str(get_hermes_home()))
         self._labels[_ENVIRONMENT_LABEL_KEY] = _reuse_environment_fingerprint(
-            **identity, egress=egress_label, sandbox="" if persistent_filesystem else task_label,
+            **identity, egress=egress_label, sandbox="" if persistent_filesystem else _sandbox_dir_name(task_id),
             shared_key=shared_container_key)
         # What pre-canonical-name processes labeled the same config with (none under a shared key).
         self._legacy_fingerprint = None if shared_container_key else _reuse_environment_fingerprint(**identity)
@@ -829,7 +831,7 @@ class DockerEnvironment(BaseEnvironment):
         self._all_run_args = all_run_args
         self._network = network
 
-        self._container_id = (persist_across_processes and self._attach_existing_container()) or self._docker_run(cwd)
+        self._container_id = self._attach_existing_container() or self._docker_run(cwd)
 
         # Init-time env forwarding args seed the snapshot.
         self._init_env_args = self._build_init_env_args()
@@ -978,13 +980,13 @@ class DockerEnvironment(BaseEnvironment):
         return volume_args, writable_args
 
     def _attach_existing_container(self) -> str | None:
-        """Id of the existing container of our identity, started unless running, or ``None`` when
-        a fresh one must run ("ONE long-lived container shared across sessions"; opt out via
-        ``docker_persist_across_processes: false``): the holder of our canonical name, else a
-        container from before canonical names, found by the labels those processes used.
-        Network guard is lockdown-only: a bridge container under ``docker_network: false``
+        """Id of the existing container of our identity (the holder of our canonical name, else a
+        pre-canonical-name one found by label), started unless running; ``None`` when a fresh one
+        must run, always for a session-scoped container. Network guard is lockdown-only: a bridge container under ``docker_network: false``
         is removed and recreated, but a ``none`` container under default config is kept so
         ``--network=none`` in extra args doesn't churn containers every startup."""
+        if not self._persist_across_processes:
+            return None
         existing = self._named_container() or self._adopt_legacy_container()
         if existing is None:
             return None
@@ -1040,7 +1042,13 @@ class DockerEnvironment(BaseEnvironment):
 
         if state != "running":
             self._refuse_foreign_holders()
-        self._ensure_running(container_id, state)
+            try:
+                run_capture([self._docker_exe, "start", container_id], timeout=30, check=True)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                # The name is taken, so there is no fresh container to fall back to.
+                raise RuntimeError(
+                    f"Could not start sandbox container {self._name} ({container_id[:12]}, state={state}): "
+                    f"{e.stderr.strip() if isinstance(e.stderr, str) and e.stderr.strip() else e}") from e
         logger.info(
             "Reusing container %s (task=%s, profile=%s, prior state=%s)",
             container_id[:12], task_label, profile_name, state)
@@ -1050,7 +1058,10 @@ class DockerEnvironment(BaseEnvironment):
         """Before our container comes up (run or start): refuse when a running hermes container of
         another identity bind-mounts read-write a real host path we bind read-write — two sandbox
         configurations writing one tree. Containers of our identity are ours to attach, a read-only
-        side never conflicts, and probe failures proceed: this must never brick startup."""
+        side never conflicts, and probe failures proceed: this must never brick startup. A
+        session-scoped container shares nothing by name, so it is not probed."""
+        if not self._persist_across_processes:
+            return
         root = _persistent_sandbox_root()
         ours = _shared_rw_sources(_parse_bind_args(self._all_run_args), root)
         if not ours:
@@ -1060,10 +1071,12 @@ class DockerEnvironment(BaseEnvironment):
              "--format", "{{.ID}}"], timeout=10,
             fail="docker ps mount-conflict probe failed: %s",
             nonzero="docker ps mount-conflict probe returned %d: %s")
-        for cid in result.stdout.split() if result is not None else ():
-            holder = self._inspect_container(cid)
-            if holder is None or self._is_ours(holder["labels"]):
+        if result is None or not result.stdout.split():
+            return
+        for holder in self._inspect_containers(result.stdout.split()):
+            if self._is_ours(holder["labels"]):
                 continue
+            cid = holder["id"]
             binds = [(m.get("Source", ""), m.get("Destination", ""), m.get("RW") is True)
                      for m in holder["mounts"] if m.get("Type") == "bind"]
             if shared := sorted(ours & _shared_rw_sources(binds, root)):
@@ -1088,14 +1101,6 @@ class DockerEnvironment(BaseEnvironment):
         except (subprocess.SubprocessError, OSError) as e:
             logger.warning("Docker: could not pull %s: %s", self._image, e)
             return False
-
-    def _start_container(self, container_id: str) -> Exception | None:
-        """``docker start`` a stopped container; returns the failure instead of raising."""
-        try:
-            run_capture([self._docker_exe, "start", container_id], timeout=30, check=True)
-            return None
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            return e
 
     def _run_command(self, name: str, workdir: str) -> list[str]:
         """``docker run -d`` argv for a fresh ``sleep infinity`` container (idle reaper handles
@@ -1123,43 +1128,41 @@ class DockerEnvironment(BaseEnvironment):
         container, which the name may by now be held by."""
         run_cmd = self._run_command(self._name, cwd)
         logger.debug("Starting container: %s", ' '.join(run_cmd))
-        if self._persist_across_processes:
-            self._refuse_foreign_holders()
+        self._refuse_foreign_holders()
         try:
             result = run_capture(
                 run_cmd, timeout=120, check=True,  # image pull may take a while
                 env=self._docker_client_env(self._run_env_values))
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            if "already in use" in (getattr(e, "stderr", None) or "") and (holder := self._named_container()):
-                logger.info("Container name %s was taken by a sibling process — attaching to %s",
-                            self._name, holder[0][:12])
-                return self._ensure_running(*holder)
+            if (isinstance(e, subprocess.CalledProcessError) and "already in use" in (e.stderr or "")
+                    and (container_id := self._attach_existing_container())):
+                logger.info("Container name %s was taken by a sibling process — attached", self._name)
+                return container_id
             logger.warning("docker run failed for %s, cleaning up orphaned container: %s", self._name, e)
-            subprocess.run(
-                [self._docker_exe, "rm", self._name],
-                capture_output=True, timeout=10, stdin=subprocess.DEVNULL)
+            _docker_query([self._docker_exe, "rm", self._name], timeout=10,
+                          fail="docker rm %s failed: %s", fail_args=(self._name,))
             raise
         container_id = result.stdout.strip()
         logger.info("Started container %s (%s)", self._name, container_id[:12])
         return container_id
 
-    def _inspect_container(self, ref: str) -> dict | None:
-        """``{"id", "state", "labels", "mounts"}`` of container *ref* (name or id) from ONE inspect, or
-        ``None`` when there is no such container or the inspect fails or is unreadable."""
+    def _inspect_containers(self, refs: list[str]) -> list[dict]:
+        """``{"id", "state", "labels", "mounts"}`` of each of the containers *refs* (names or ids) from
+        ONE inspect. A ref that is gone or unreadable is left out; docker still prints the others."""
         result = _docker_query(
             [self._docker_exe, "inspect", "--type", "container", "--format",
              '{"id":{{json .Id}},"state":{{json .State.Status}},"labels":{{json .Config.Labels}},'
-             '"mounts":{{json .Mounts}}}', ref], timeout=10,
-            fail="docker inspect %s failed: %s", fail_args=(ref,), nonzero="docker inspect %s returned %d: %s")
-        if result is None:
-            return None
-        try:
-            data = json.loads(result.stdout)
-            return {"id": data["id"], "state": data["state"], "labels": dict(data["labels"] or {}),
-                    "mounts": list(data["mounts"] or [])}
-        except (ValueError, TypeError, KeyError):
-            logger.debug("docker inspect %s: unreadable output", ref)
-            return None
+             '"mounts":{{json .Mounts}}}', *refs], timeout=10,
+            fail="docker inspect %s failed: %s", fail_args=(refs,))
+        containers = []
+        for line in result.stdout.splitlines() if result is not None else ():
+            try:
+                data = json.loads(line)
+                containers.append({"id": data["id"], "state": data["state"], "labels": dict(data["labels"] or {}),
+                                   "mounts": list(data["mounts"] or [])})
+            except (ValueError, TypeError, KeyError):
+                logger.debug("docker inspect %s: unreadable output %r", refs, line)
+        return containers
 
     def _is_ours(self, labels: dict) -> bool:
         """Labeled with our fingerprint, or — renamed from before canonical names, labels being
@@ -1169,7 +1172,7 @@ class DockerEnvironment(BaseEnvironment):
     def _named_container(self) -> tuple[str, str] | None:
         """``(id, state)`` of the container holding our name, ``None`` when there is none. The name is
         derived from our fingerprint, so a holder labeled with another one is not ours: refuse."""
-        data = self._inspect_container(self._name)
+        data = next(iter(self._inspect_containers([self._name])), None)
         if data is None:
             return None
         if not self._is_ours(data["labels"]):
@@ -1186,7 +1189,9 @@ class DockerEnvironment(BaseEnvironment):
         recovery, every sibling's spawn — finds it by name. Its labels stay as they are, so
         label-keyed tooling (orphan reaper, lab wake) still resolves it. A failed rename means a
         sibling renamed it first: the name holder decides."""
-        legacy = self._find_reusable_container()
+        # ponytail: legacy-names shim (with _legacy_fingerprint, _is_ours' second value and
+        # _find_legacy_container) — delete once pre-canonical-name containers have aged out.
+        legacy = self._find_legacy_container()
         if legacy is None:
             return None
         renamed = _docker_query(
@@ -1197,15 +1202,6 @@ class DockerEnvironment(BaseEnvironment):
             return self._named_container() or legacy
         logger.info("Adopted pre-canonical-name container %s as %s", legacy[0][:12], self._name)
         return legacy
-
-    def _ensure_running(self, container_id: str, state: str) -> str:
-        """*container_id*, started first unless it is running. A failed start raises: the name is
-        taken, so there is no fresh container to fall back to."""
-        if state != "running" and (err := self._start_container(container_id)) is not None:
-            raise RuntimeError(
-                f"Could not start sandbox container {self._name} ({container_id[:12]}, state={state}): "
-                f"{(getattr(err, 'stderr', None) or '').strip() or err}") from err
-        return container_id
 
     # --- Env forwarding ---
     def _docker_client_env(self, values: dict[str, str]) -> dict[str, str] | None:
@@ -1366,7 +1362,7 @@ class DockerEnvironment(BaseEnvironment):
             fail="docker inspect NetworkMode failed: %s", nonzero="docker inspect NetworkMode returned %d: %s")
         return (result.stdout.strip() or None) if result is not None else None
 
-    def _find_reusable_container(self) -> Optional[tuple[str, str]]:
+    def _find_legacy_container(self) -> Optional[tuple[str, str]]:
         """``(container_id, state)`` of a container from before canonical names labeled for this
         task/profile/egress posture and legacy environment fingerprint, or ``None`` on miss or any
         failure. Explicit shared keys opt out of the environment filter. The egress posture is a label
@@ -1374,11 +1370,8 @@ class DockerEnvironment(BaseEnvironment):
         reused after ``hermes egress disable`` (baked-in proxy env and CA mounts), and every
         container this class creates carries the label. The ``{{.Label "key"}}`` template
         function is Docker-only — podman ps exits 125 on it — so the probe never uses it (#99213)."""
-        filters = ["--filter", "label=hermes-agent=1", *(
-            arg for key in ("hermes-task-id", "hermes-profile", _EGRESS_LABEL_KEY)
-            for arg in ("--filter", f"label={key}={self._labels[key]}"))]
-        if self._legacy_fingerprint:
-            filters.extend(["--filter", f"label={_ENVIRONMENT_LABEL_KEY}={self._legacy_fingerprint}"])
+        labels = {**self._labels, _ENVIRONMENT_LABEL_KEY: self._legacy_fingerprint}
+        filters = [arg for key, value in labels.items() if value for arg in ("--filter", f"label={key}={value}")]
         result = _docker_query(
             [self._docker_exe, "ps", "-a", *filters, "--format", "{{.ID}}\t{{.State}}"], timeout=10,
             fail="docker ps probe failed: %s — will start a fresh container",
@@ -1425,8 +1418,8 @@ class DockerEnvironment(BaseEnvironment):
             return
 
         if not force_remove and self._persist_across_processes:
-            # Drop the in-process handle so a fresh __init__ re-probes via
-            # labels instead of reusing a stale Python reference.
+            # Drop the in-process handle so a fresh __init__ re-probes by
+            # name instead of reusing a stale Python reference.
             self._container_id = None
             return
 

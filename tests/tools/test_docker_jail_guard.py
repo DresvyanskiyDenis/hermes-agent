@@ -43,20 +43,17 @@ class _FakeDaemon:
         monkeypatch.setattr(docker_env.subprocess, "run", self)
         monkeypatch.setattr(docker_env, "_popen_bash", self._exec)
 
-    def add(self, name, labels, *, state="running", binds=(), image="python:3.11") -> str:
+    def add(self, name, labels, *, binds=(), image="python:3.11") -> str:
         cid = uuid.uuid4().hex + uuid.uuid4().hex
         self.containers[cid] = {
-            "name": name, "labels": dict(labels), "state": state, "image": image,
-            "finished": _FINISHED_LONG_AGO if state == "exited" else "0001-01-01T00:00:00Z",
+            "name": name, "labels": dict(labels), "state": "running", "image": image,
+            "finished": "0001-01-01T00:00:00Z",
             "mounts": [{"Type": "bind" if src.startswith("/") else "volume", "Source": src,
                         "Destination": dst, "RW": rw} for src, dst, rw in binds]}
         return cid
 
     def find(self, ref):
         return next((cid for cid, c in self.containers.items() if ref in (c["name"], cid[:len(ref)])), None)
-
-    def named(self, name):
-        return self.containers[self.find(name)]
 
     def stop(self, cid):
         self.containers[cid].update(state="exited", finished=_FINISHED_LONG_AGO)
@@ -81,12 +78,12 @@ class _FakeDaemon:
         if sub in ("version", "image"):
             return 0, "null", ""
         if sub == "ps":
-            filters = [cmd[i + 1].split("=", 1) for i, arg in enumerate(cmd) if arg == "--filter"]
+            labels = dict(f.removeprefix("label=").split("=", 1) for f in _flag_values(cmd, "--filter")
+                          if f.startswith("label="))
+            states = {f.removeprefix("status=") for f in _flag_values(cmd, "--filter") if f.startswith("status=")}
             hits = [(cid, c) for cid, c in self.containers.items()
-                    if ("-a" in cmd or c["state"] == "running")
-                    and all(c["state"] == value if key == "status" else
-                            c["labels"].get(value.split("=", 1)[0]) == value.split("=", 1)[1]
-                            for key, value in filters)]
+                    if ("-a" in cmd or c["state"] == "running") and (not states or c["state"] in states)
+                    and labels.items() <= c["labels"].items()]
             with_state = "{{.State}}" in cmd[cmd.index("--format") + 1]
             return 0, "".join(f"{cid}\t{c['state']}\n" if with_state else f"{cid}\n" for cid, c in hits), ""
         if sub == "run":
@@ -94,10 +91,15 @@ class _FakeDaemon:
             if (holder := self.find(name)) is not None:
                 return 125, "", (f'docker: Error response from daemon: Conflict. The container name "/{name}" '
                                  f'is already in use by container "{holder}".')
-            labels = dict(cmd[i + 1].split("=", 1) for i, arg in enumerate(cmd) if arg == "--label")
-            specs = [cmd[i + 1].split(":") for i, arg in enumerate(cmd) if arg == "-v"]
+            labels = dict(label.split("=", 1) for label in _flag_values(cmd, "--label"))
+            specs = [spec.split(":") for spec in _flag_values(cmd, "-v")]
             binds = [(spec[0], spec[1], spec[2:] != ["ro"]) for spec in specs]
             return 0, self.add(name, labels, binds=binds, image=cmd[-3]) + "\n", ""
+        if sub == "inspect" and cmd[2:4] == ["--type", "container"]:  # one JSON line per container found
+            found = [cid for cid in map(self.find, cmd[cmd.index("--format") + 2:]) if cid is not None]
+            out = "".join(json.dumps({"id": cid, **{k: self.containers[cid][k] for k in ("state", "labels", "mounts")}})
+                          + "\n" for cid in found)
+            return (0 if len(found) == len(cmd) - cmd.index("--format") - 2 else 1), out, ""
         cid = self.find(ref)
         if cid is None:
             return 1, "", f"Error response from daemon: No such container: {ref}"
@@ -106,9 +108,8 @@ class _FakeDaemon:
             fmt = cmd[cmd.index("--format") + 1]
             if fmt == "{{.State.FinishedAt}}":
                 return 0, c["finished"] + "\n", ""
-            if fmt == "{{.Config.Image}}":
-                return 0, c["image"] + "\n", ""
-            return 0, json.dumps({"id": cid, "state": c["state"], "labels": c["labels"], "mounts": c["mounts"]}), ""
+            assert fmt == "{{.Config.Image}}", fmt
+            return 0, c["image"] + "\n", ""
         if sub == "rename":
             if self.find(cmd[3]) is not None:
                 return 1, "", f'Error response from daemon: Conflict. The container name "/{cmd[3]}" is already in use'
@@ -135,6 +136,10 @@ class _FakeDaemon:
 _real_popen_bash = docker_env._popen_bash
 
 
+def _flag_values(cmd, flag):
+    return [cmd[i + 1] for i, arg in enumerate(cmd) if arg == flag]
+
+
 @pytest.fixture
 def daemon(monkeypatch, tmp_path):
     return _FakeDaemon(monkeypatch, tmp_path)
@@ -145,9 +150,9 @@ def _spawn(**kwargs):
     return docker_env.DockerEnvironment(**kwargs)
 
 
-def _jail(tmp_path, name="jail"):
-    path = tmp_path / name
-    path.mkdir(exist_ok=True)
+def _jail(tmp_path):
+    path = tmp_path / "jail"
+    path.mkdir()
     return str(path)
 
 
@@ -202,10 +207,10 @@ def test_volatile_tempdir_mount_source_keeps_the_name(tmp_path):
 
 
 def test_tmpfs_sandboxes_of_distinct_tasks_get_distinct_names(daemon):
-    """A tmpfs sandbox has no host path carrying its task bucket, so the bucket is hashed in:
-    rollouts on one image must not collapse into one container."""
+    """A tmpfs sandbox has no host path carrying its task bucket, so the bucket is hashed in —
+    injectively: ``a:b`` and ``a_b`` share a label value but must not share a container."""
     one = _spawn(task_id="rollout:one", persistent_filesystem=False)
-    two = _spawn(task_id="rollout:two", persistent_filesystem=False)
+    two = _spawn(task_id="rollout_one", persistent_filesystem=False)
 
     assert one._name != two._name and one._container_id != two._container_id
     assert _spawn(task_id="rollout:one", persistent_filesystem=False)._container_id == one._container_id
@@ -227,7 +232,7 @@ def test_session_scoped_container_takes_no_shared_identity(daemon):
 def test_spawn_runs_under_the_canonical_name_with_every_label(daemon):
     env = _spawn()
 
-    container = daemon.named(env._name)
+    container = daemon.containers[daemon.find(env._name)]
     assert env._name == docker_env._canonical_container_name(env._labels["hermes-environment"])
     assert container["labels"] == env._labels
     assert container["labels"].keys() == {
@@ -317,10 +322,12 @@ def test_drift_runs_a_new_name_and_leaves_the_stale_container_to_the_reaper(daem
 ], ids=["other-bucket", "other-profile", "drifted"])
 def test_another_identity_holding_a_real_rw_path_refuses(daemon, tmp_path, holder_labels):
     jail = _jail(tmp_path)
-    holder = daemon.add("hermes-holder", _foreign_labels(**holder_labels), binds=[(jail, "/home/bot", True)])
+    labels = _foreign_labels(**holder_labels)
+    holder = daemon.add("hermes-holder", labels, binds=[(jail, "/home/bot", True)])
 
-    with pytest.raises(RuntimeError, match=f"{jail}.*{holder[:12]}"):
+    with pytest.raises(RuntimeError, match=f"{jail}.*{holder[:12]}") as refused:
         _spawn(volumes=[f"{jail}:/home/bot"])
+    assert f"task={labels['hermes-task-id']!r}, profile={labels['hermes-profile']!r}" in str(refused.value)
     assert not daemon.subcommands("run")
 
 
@@ -332,17 +339,6 @@ def test_read_only_side_never_conflicts(daemon, tmp_path, holder_rw, ours):
     _spawn(volumes=[jail + ours])
 
     assert len(daemon.subcommands("run")) == 1
-
-
-def test_shared_sandbox_dirs_alone_never_conflict(daemon):
-    """Drift on a profile's default bucket shares only its sandbox dirs with the stale container."""
-    old = _spawn()
-    daemon.containers[old._container_id].update(name="hermes-stale")
-    daemon.containers[old._container_id]["labels"]["hermes-environment"] = "f" * 24
-
-    new = _spawn()
-
-    assert new._container_id != old._container_id
 
 
 def test_stopped_container_start_is_refused_while_another_identity_holds_its_path(daemon, tmp_path):
@@ -378,7 +374,7 @@ def test_recovery_runs_under_the_canonical_name_when_the_container_is_gone(daemo
 
     assert result["returncode"] == 0
     assert daemon.find(env._name) == env._container_id
-    assert [c[c.index("--name") + 1] for c in daemon.subcommands("run")] == [env._name, env._name]
+    assert [_flag_values(c, "--name") for c in daemon.subcommands("run")] == [[env._name], [env._name]]
 
 
 def test_jail_guard_refused_recovery_retries_on_next_exec(daemon, tmp_path):
@@ -426,7 +422,7 @@ def test_legacy_container_is_adopted_by_label_and_renamed(daemon):
 
 # --- mount parsing --------------------------------------------------------------------------
 
-def test_jail_guard_parse_bind_args():
+def test_parse_bind_args():
     binds = docker_env._parse_bind_args([
         "-v", "/a:/x", "-v", "/b:/y:ro,z", "--mount", "type=bind,source=/c,destination=/z,readonly",
         "--mount", "type=bind,src=/d,dst=/w", "--mount", "type=volume,source=named,target=/v",
@@ -435,7 +431,7 @@ def test_jail_guard_parse_bind_args():
     assert binds == [("/a", "/x", True), ("/b", "/y", False), ("/c", "/z", False), ("/d", "/w", True)]
 
 
-def test_jail_guard_parse_bind_args_joined_flags_and_named_volumes():
+def test_parse_bind_args_joined_flags_and_named_volumes():
     parse = docker_env._parse_bind_args
 
     assert parse(["--volume=/a:/x", "--mount=type=bind,source=/b,target=/y,ro"]) == parse(

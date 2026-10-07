@@ -4,7 +4,7 @@
 # its own throwaway root. Exit: 0 pass, 1 fail, 77 skip.
 #   A: a respawn of one configuration attaches to the container under its canonical name.
 #   B: another task bucket sharing a running jail's path RW is refused, naming the holder, in
-#      either order (default first, then forge in a fresh root).
+#      either order (default holds and forge is refused; in a fresh root, the reverse).
 #   C: a same-bucket spawn whose volumes diverge while sharing the jail RW is refused.
 #   D: per-task buckets sharing only sandbox dirs coexist.
 #   E: daemon-restart ordering — with the default jail stopped, forge comes up first; starting the
@@ -32,14 +32,12 @@ T=$(realpath "$(mktemp -d)")
 GVOL=jaildup_g_$(basename "$T")  # scenario G's named volume, unique to this run
 A=$T/jailA B=$T/jailB C=$T/jailC E=$T/jailE
 mkdir -p "$A" "$B" "$C" "$E" "$T/tmp"
-docker ps -aq --no-trunc --filter label=hermes-agent=1 >"$T/pre.ids"
 export CREATED_IDS=$T/created.ids
 : >"$CREATED_IDS"
 
 cleanup() {
   local rc=$? id
   while read -r id; do
-    grep -q "^$id" "$T/pre.ids" && continue
     docker inspect --format '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' "$id" 2>/dev/null \
       | grep -q "^$T/" && docker rm -f "$id" >/dev/null
   done <"$CREATED_IDS"
