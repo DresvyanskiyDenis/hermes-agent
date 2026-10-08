@@ -546,9 +546,10 @@ def test_same_fingerprint_under_another_name_holding_a_real_rw_path_refuses(daem
     assert not daemon.subcommands("run")
 
 
-def test_label_less_container_is_not_ours_under_a_shared_key(daemon, tmp_path):
-    """Under a shared key there is no legacy fingerprint: a container without one (any other key's
-    pre-canonical container) is not ours, so its RW jail path refuses."""
+def test_label_less_rw_holder_refuses_under_a_shared_key(daemon, tmp_path):
+    """Under a shared key there is no legacy fingerprint, so a label-less container (any other key's
+    pre-canonical one) matches ours on that label alone: holding our RW jail path under another
+    name, it still refuses — the probe spares only our name holder."""
     jail = _jail(tmp_path)
     labels = _foreign_labels(**{"hermes-profile": "other_key-0123456789ab"})
     del labels["hermes-environment"]
