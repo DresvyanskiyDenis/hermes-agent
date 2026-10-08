@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import re
@@ -898,6 +899,13 @@ def test_empty_shared_container_key_preserves_profile_isolation(monkeypatch):
 # ── Cross-process container reuse (issue #20561) ──────────────────
 
 
+def _found_by_ps(ps_cmd, cid, state):
+    """``inspect --type container`` output for the container a label-filtered ``ps`` matched: it
+    carries every label the probe filtered on."""
+    labels = dict(a.removeprefix("label=").split("=", 1) for a in ps_cmd if a.startswith("label="))
+    return json.dumps({"id": cid, "name": "/hermes-legacy", "state": state, "labels": labels, "mounts": []}) + "\n"
+
+
 def _mock_subprocess_run_with_reuse(monkeypatch, ps_state: str | None,
                                      start_succeeds: bool = True):
     """Reuse-aware subprocess.run mock.
@@ -913,6 +921,7 @@ def _mock_subprocess_run_with_reuse(monkeypatch, ps_state: str | None,
     commands actually ran.
     """
     calls = []
+    probes = []
 
     def _run(cmd, **kwargs):
         calls.append((list(cmd) if isinstance(cmd, list) else cmd, kwargs))
@@ -920,9 +929,13 @@ def _mock_subprocess_run_with_reuse(monkeypatch, ps_state: str | None,
             sub = cmd[1]
             if sub == "version":
                 return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+            if sub == "inspect" and probes and "reused-cid" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout=_found_by_ps(probes[0], "reused-cid", ps_state),
+                                                   stderr="")
             if sub == "ps":
                 if ps_state is None:
                     return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+                probes.append(cmd)
                 # 2-field format: ID, State. The egress posture is enforced
                 # by the label filters on the ps command itself (#99213).
                 return subprocess.CompletedProcess(
@@ -1026,6 +1039,7 @@ def test_reuse_probe_format_is_podman_compatible(monkeypatch):
     monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
 
     calls = []
+    probes = []
 
     def _run(cmd, **kwargs):
         calls.append(list(cmd) if isinstance(cmd, list) else cmd)
@@ -1033,7 +1047,11 @@ def test_reuse_probe_format_is_podman_compatible(monkeypatch):
             sub = cmd[1]
             if sub == "version":
                 return subprocess.CompletedProcess(cmd, 0, stdout="podman version", stderr="")
+            if sub == "inspect" and probes and "podman-cid" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout=_found_by_ps(probes[0], "podman-cid", "running"),
+                                                   stderr="")
             if sub == "ps":
+                probes.append(cmd)
                 if "--format" in cmd:
                     fmt = cmd[cmd.index("--format") + 1]
                     if "{{.Label" in fmt:

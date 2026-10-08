@@ -1234,12 +1234,19 @@ class DockerEnvironment(BaseEnvironment):
         """``(id, state)`` of a container from before canonical names, found by the labels those
         processes used, renamed to our name (atomic, running or not) so every later lookup — our
         recovery, every sibling's spawn — finds it by name. Its labels stay as they are, so
-        label-keyed tooling (orphan reaper, lab wake) still resolves it. A failed rename means a
-        sibling renamed it first: the name holder decides."""
+        label-keyed tooling (orphan reaper, lab wake) still resolves it. The lookup carries no
+        fingerprint filter under a shared key, where another task's canonical container can match on
+        a colliding sanitized task label: only a container with the legacy fingerprint (none under a
+        shared key) is adopted. A failed rename means a sibling renamed it first: the name holder decides."""
         # ponytail: legacy-names shim (with _legacy_fingerprint, _legacy_labels, _is_ours' second value
         # and _find_legacy_container) — delete once pre-canonical-name containers have aged out.
         legacy = self._find_legacy_container()
         if legacy is None:
+            return None
+        candidate = next(iter(self._inspect_containers([legacy[0]])), None)
+        if candidate is None or candidate["labels"].get(_ENVIRONMENT_LABEL_KEY) != self._legacy_fingerprint:
+            logger.info("Not adopting container %s: unreadable, or not labeled with the legacy fingerprint %r",
+                        legacy[0][:12], self._legacy_fingerprint)
             return None
         renamed = _docker_query(
             [self._docker_exe, "rename", legacy[0], self._name], timeout=10,
