@@ -254,6 +254,19 @@ def test_tmpfs_sandboxes_of_distinct_tasks_get_distinct_names(daemon):
     assert _spawn(task_id="rollout:one", persistent_filesystem=False)._container_id == one._container_id
 
 
+@pytest.mark.parametrize("persistent", [True, False], ids=["bind", "tmpfs"])
+def test_shared_key_keeps_task_buckets_apart(daemon, persistent):
+    """A shared key shares a profile's container across profiles, not across task buckets: a per-task
+    rollout must not attach to (or, with a pinned image, replace) another task's container."""
+    one = _spawn(task_id="rollout:one", shared_container_key="team", persistent_filesystem=persistent)
+    two = _spawn(task_id="rollout:two", shared_container_key="team", persistent_filesystem=persistent,
+                 image="python:3.12", image_pinned=True)
+
+    assert one._labels["hermes-environment"] != two._labels["hermes-environment"]
+    assert one._name != two._name and one._container_id != two._container_id
+    assert len(daemon.containers) == 2 and not daemon.subcommands("rm")
+
+
 def test_session_scoped_container_takes_no_shared_identity(daemon):
     """Without cross-process persistence the container is the session's alone: a unique name, no
     lookup, and no probe of other containers."""

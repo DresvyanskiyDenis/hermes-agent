@@ -177,12 +177,13 @@ def _reuse_environment_fingerprint(
 
     *egress* is the egress posture label: its proxy env and CA mount are immutable after creation.
     ``None`` hashes the pre-canonical-name payload, kept only to find legacy containers.
-    *sandbox* is the task bucket of a tmpfs sandbox, which has no host path to carry it.
-    *shared_key*: explicit sharing opts into the first creator's settings, so only the key and the
-    egress posture identify the container.
+    *sandbox* is the task bucket of a tmpfs sandbox, which has no host path to carry it, and of every
+    shared-key sandbox, whose mounts are not hashed.
+    *shared_key*: explicit sharing opts into the first creator's settings, so only the key, the egress
+    posture and the task bucket identify the container.
     """
     if shared_key:
-        identity = {"shared_key": shared_key, "egress": egress}
+        identity = {"shared_key": shared_key, "egress": egress, "sandbox": sandbox}
     else:
         normalized_home = os.path.normcase(os.path.abspath(os.path.expanduser(hermes_home)))
         canonical_mounts = [
@@ -820,7 +821,8 @@ class DockerEnvironment(BaseEnvironment):
             _EGRESS_LABEL_KEY: egress_label}
         identity = dict(image=image, mount_args=[*writable_args, *volume_args], hermes_home=str(get_hermes_home()))
         self._labels[_ENVIRONMENT_LABEL_KEY] = _reuse_environment_fingerprint(
-            **identity, egress=egress_label, sandbox="" if persistent_filesystem else _sandbox_dir_name(task_id),
+            **identity, egress=egress_label,
+            sandbox=_sandbox_dir_name(task_id) if shared_container_key or not persistent_filesystem else "",
             shared_key=shared_container_key)
         # What pre-canonical-name processes labeled the same config with (none under a shared key).
         self._legacy_fingerprint = None if shared_container_key else _reuse_environment_fingerprint(**identity)
