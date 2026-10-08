@@ -241,7 +241,7 @@ for attempt in 1 2 3; do
   [ "$aliveH1" = True ] && [ "$aliveH2" = True ] || fail "exec failed in a racer: $aliveH1 / $aliveH2"
   n=$(holders "$TERMINAL_SANDBOX_DIR/docker/default/home" -a)
   [ "$n" = 1 ] || fail "$n containers (any state) mount the raced sandbox (want 1)"
-  attached=$(grep -l "was taken by a sibling process" "$T/race.$attempt".[12].err | wc -l)
+  attached=$(($(grep -l "was taken by a sibling process" "$T/race.$attempt".[12].err | wc -l)))
   case "$attached" in
     1) raced=$attempt; break ;;
     0) echo "scenario H attempt $attempt: spawns serialized (no sibling attach logged), retrying" ;;
