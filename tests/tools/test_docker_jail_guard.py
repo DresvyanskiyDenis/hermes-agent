@@ -662,7 +662,6 @@ def test_legacy_shared_key_container_is_adopted_and_stays_ours(daemon):
     assert len(daemon.subcommands("run")) == 1  # the probe's own
 
 
-
 def test_shared_key_legacy_lookup_skips_another_tasks_canonical_container(daemon):
     """Under a shared key the legacy lookup has no fingerprint filter, and ``a:b`` and ``a_b`` share a
     sanitized task label: the other task's canonical container matches it but carries a fingerprint,
@@ -676,6 +675,7 @@ def test_shared_key_legacy_lookup_skips_another_tasks_canonical_container(daemon
     assert daemon.containers[first._container_id]["name"] == first._name
     assert not daemon.subcommands("rename")
     assert len(daemon.subcommands("run")) == 2
+
 
 # --- mount parsing --------------------------------------------------------------------------
 

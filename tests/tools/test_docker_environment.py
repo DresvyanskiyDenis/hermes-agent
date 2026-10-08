@@ -929,7 +929,7 @@ def _mock_subprocess_run_with_reuse(monkeypatch, ps_state: str | None,
             sub = cmd[1]
             if sub == "version":
                 return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
-            if sub == "inspect" and probes and "reused-cid" in cmd:
+            if sub == "inspect" and "reused-cid" in cmd:
                 return subprocess.CompletedProcess(cmd, 0, stdout=_found_by_ps(probes[0], "reused-cid", ps_state),
                                                    stderr="")
             if sub == "ps":
@@ -1047,7 +1047,7 @@ def test_reuse_probe_format_is_podman_compatible(monkeypatch):
             sub = cmd[1]
             if sub == "version":
                 return subprocess.CompletedProcess(cmd, 0, stdout="podman version", stderr="")
-            if sub == "inspect" and probes and "podman-cid" in cmd:
+            if sub == "inspect" and "podman-cid" in cmd:
                 return subprocess.CompletedProcess(cmd, 0, stdout=_found_by_ps(probes[0], "podman-cid", "running"),
                                                    stderr="")
             if sub == "ps":

@@ -6,9 +6,8 @@ expose it, so operators could not request networkless Docker execution from
 config.yaml.
 """
 
-import json
-
 import tools.terminal_tool as terminal_tool
+from tests.tools.test_docker_environment import _found_by_ps
 from tools.environments import docker as docker_env
 
 
@@ -100,11 +99,8 @@ def _reuse_guard_harness(
                 # adoption check sees the legacy fingerprint. A name lookup misses, as before.
                 refs = cmd[cmd.index("--format") + 2:]
                 if "existing-container-id" in refs:
-                    labels = dict(a.removeprefix("label=").split("=", 1)
-                                  for a in legacy_probes[-1] if a.startswith("label=")) if legacy_probes else {}
-                    Result.stdout = json.dumps(
-                        {"id": "existing-container-id", "name": "/hermes-legacy", "state": "running",
-                         "labels": labels, "mounts": []}) + "\n"
+                    Result.stdout = _found_by_ps(legacy_probes[-1] if legacy_probes else [],
+                                                 "existing-container-id", "running")
                 else:
                     Result.returncode = 1
                     Result.stderr = "Error response from daemon: No such container: " + (refs[0] if refs else "")
