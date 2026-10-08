@@ -5,6 +5,7 @@ resource limits (CPU, memory, disk), and optional filesystem persistence via
 bind mounts.
 """
 
+import contextlib
 import datetime
 import hashlib
 import json
@@ -177,13 +178,12 @@ def _reuse_environment_fingerprint(
 
     *egress* is the egress posture label: its proxy env and CA mount are immutable after creation.
     ``None`` hashes the pre-canonical-name payload, kept only to find legacy containers.
-    *sandbox* is the task bucket of a tmpfs sandbox, which has no host path to carry it, and of every
-    shared-key sandbox, whose mounts are not hashed.
+    *sandbox* is the task bucket: a tmpfs or shared-key sandbox has no hashed host path to carry it.
     *shared_key*: explicit sharing opts into the first creator's settings, so only the key, the egress
     posture and the task bucket identify the container.
     """
     if shared_key:
-        identity = {"shared_key": shared_key, "egress": egress, "sandbox": sandbox}
+        identity = {"shared_key": shared_key}
     else:
         normalized_home = os.path.normcase(os.path.abspath(os.path.expanduser(hermes_home)))
         canonical_mounts = [
@@ -191,10 +191,10 @@ def _reuse_environment_fingerprint(
              if _is_volatile_mount_spec(spec) else spec)
             for spec in mount_args]
         identity = {"image": image, "mount_args": canonical_mounts, "hermes_home": normalized_home}
-        if egress is not None:
-            identity["egress"] = egress
-        if sandbox:
-            identity["sandbox"] = sandbox
+    if egress is not None:
+        identity["egress"] = egress
+    if sandbox:
+        identity["sandbox"] = sandbox
     payload = json.dumps(identity, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
 
@@ -821,11 +821,11 @@ class DockerEnvironment(BaseEnvironment):
             _EGRESS_LABEL_KEY: egress_label}
         identity = dict(image=image, mount_args=[*writable_args, *volume_args], hermes_home=str(get_hermes_home()))
         self._labels[_ENVIRONMENT_LABEL_KEY] = _reuse_environment_fingerprint(
-            **identity, egress=egress_label,
-            sandbox=_sandbox_dir_name(task_id) if shared_container_key or not persistent_filesystem else "",
-            shared_key=shared_container_key)
+            **identity, egress=egress_label, sandbox=_sandbox_dir_name(task_id), shared_key=shared_container_key)
         # What pre-canonical-name processes labeled the same config with (none under a shared key).
         self._legacy_fingerprint = None if shared_container_key else _reuse_environment_fingerprint(**identity)
+        self._legacy_labels = {key: value for key, value in {
+            **self._labels, _ENVIRONMENT_LABEL_KEY: self._legacy_fingerprint}.items() if value}
         # A session-scoped container (no cross-process persistence) is nobody else's to share.
         self._name = (_canonical_container_name(self._labels[_ENVIRONMENT_LABEL_KEY]) if persist_across_processes
                       else f"hermes-{uuid.uuid4().hex[:8]}")
@@ -1027,12 +1027,12 @@ class DockerEnvironment(BaseEnvironment):
         return container_id
 
     def _recreate_reason(self, container_id: str) -> str | None:
-        """Why the existing container must give way to a fresh one, or ``None`` to keep it.
+        """Why the existing container must give way to a fresh one, or ``None`` to keep it (logging why
+        a mismatched image is kept).
 
         Image guard: a normal config hashes the image into the name, so a changed image is a new name
         by construction; only a shared key (whose fingerprint omits the image) or an adopted
-        pre-canonical-name container holds our name under another image. A pinned image is recreated
-        once it is available; a default-image flip keeps the sandbox and logs how to approve it.
+        pre-canonical-name container holds our name under another image.
 
         Network guard is lockdown-only: a bridge container under ``docker_network: false`` is
         recreated, but a ``none`` container under default config is kept so ``--network=none`` in
@@ -1138,35 +1138,34 @@ class DockerEnvironment(BaseEnvironment):
         fail "already in use", and its container is then ours too: the loser waits for it to become
         inspectable and attaches, never removing by name — a plain ``rm`` succeeds on the sibling's
         still-"Created" container. Any other failure is cleaned up by ``_remove_failed_run``."""
-        cid_dir = tempfile.mkdtemp(prefix="hermes-cid-")  # docker refuses a --cidfile that exists
-        run_cmd = self._run_command(self._name, cwd, os.path.join(cid_dir, "cid"))
-        logger.debug("Starting container: %s", ' '.join(run_cmd))
         self._refuse_foreign_holders()
-        try:
-            result = run_capture(
-                run_cmd, timeout=120, check=True,  # image pull may take a while
-                env=self._docker_client_env(self._run_env_values))
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            conflict = isinstance(e, subprocess.CalledProcessError) and "already in use" in (e.stderr or "")
-            if conflict:
-                deadline = time.monotonic() + _CONFLICT_ATTACH_TIMEOUT
-                # A session-scoped name is a fresh uuid: a holder of it is foreign, never ours to wait for.
-                while (self._persist_across_processes and self._named_container() is None
-                       and time.monotonic() < deadline):
-                    time.sleep(0.25)
-                if container_id := self._attach_existing_container(conflict=True):
-                    logger.info("Container name %s was taken by a sibling process — attached", self._name)
-                    return container_id
-                raise RuntimeError(
-                    f"docker run {self._name}: a sibling won the name but its container never became "
-                    f"inspectable within {_CONFLICT_ATTACH_TIMEOUT:g}s; not removing it."
-                    if self._persist_across_processes else
-                    f"docker run {self._name}: this session's random name is already held by another "
-                    "container; not removing it.") from e
-            self._remove_failed_run(os.path.join(cid_dir, "cid"), e)
-            raise
-        finally:
-            shutil.rmtree(cid_dir, ignore_errors=True)
+        with tempfile.TemporaryDirectory(prefix="hermes-cid-") as cid_dir:
+            cidfile = os.path.join(cid_dir, "cid")  # docker refuses a --cidfile that exists
+            run_cmd = self._run_command(self._name, cwd, cidfile)
+            logger.debug("Starting container: %s", ' '.join(run_cmd))
+            try:
+                result = run_capture(
+                    run_cmd, timeout=120, check=True,  # image pull may take a while
+                    env=self._docker_client_env(self._run_env_values))
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                conflict = isinstance(e, subprocess.CalledProcessError) and "already in use" in (e.stderr or "")
+                if conflict:
+                    deadline = time.monotonic() + _CONFLICT_ATTACH_TIMEOUT
+                    # A session-scoped name is a fresh uuid: a holder of it is foreign, never ours to wait for.
+                    while (self._persist_across_processes and self._named_container() is None
+                           and time.monotonic() < deadline):
+                        time.sleep(0.25)
+                    if container_id := self._attach_existing_container(conflict=True):
+                        logger.info("Container name %s was taken by a sibling process — attached", self._name)
+                        return container_id
+                    raise RuntimeError(
+                        f"docker run {self._name}: a sibling won the name but its container never became "
+                        f"inspectable within {_CONFLICT_ATTACH_TIMEOUT:g}s; not removing it."
+                        if self._persist_across_processes else
+                        f"docker run {self._name}: this session's random name is already held by another "
+                        "container; not removing it.") from e
+                self._remove_failed_run(cidfile, e)
+                raise
         container_id = result.stdout.strip()
         logger.info("Started container %s (%s)", self._name, container_id[:12])
         return container_id
@@ -1174,26 +1173,22 @@ class DockerEnvironment(BaseEnvironment):
     def _remove_failed_run(self, cidfile: str, error: Exception) -> None:
         """A failed run (exit 125, timeout mid-pull) can leave a "Created" orphan the exited-only reaper
         never catches: remove exactly ours, the id docker wrote to *cidfile* at create. Without one, a
-        client that exited saw its create fail, so the name holder (a sibling's container in its
-        create-to-start window) is not ours; a client killed by the timeout may have had its create land
-        unseen, so only then is a Created holder of our identity removed. A plain ``rm`` either way: the
-        daemon refuses it on a container that is running by now."""
+        client that exited saw its create fail, so the name holder is a sibling's; only a client killed
+        by the timeout may have had its create land unseen. A plain ``rm``: the daemon refuses it on a
+        container that is running by now."""
         # ponytail: in that timeout window a sibling's Created container is indistinguishable by labels;
         # a per-spawn nonce label would tell them apart if that window ever bites.
-        try:
-            with open(cidfile, encoding="utf-8") as f:
-                ref = f.read().strip()
-        except OSError:
-            ref = ""
+        ref = ""
+        with contextlib.suppress(OSError):
+            ref = Path(cidfile).read_text(encoding="utf-8").strip()
         if not ref and isinstance(error, subprocess.TimeoutExpired):
-            holder = next(iter(self._inspect_containers([self._name])), None)
+            holder = self._name_holder()
             if holder is not None and holder["state"] == "created" and self._is_ours(holder["labels"]):
                 ref = holder["id"]
-        if not ref:
-            logger.warning("docker run failed for %s, no container of ours to clean up: %s", self._name, error)
-            return
-        logger.warning("docker run failed for %s, cleaning up orphaned container %s: %s", self._name, ref[:12], error)
-        _docker_query([self._docker_exe, "rm", ref], timeout=10, fail="docker rm %s failed: %s", fail_args=(ref[:12],))
+        logger.warning("docker run failed for %s (orphaned container: %s): %s", self._name, ref[:12] or "none", error)
+        if ref:
+            _docker_query([self._docker_exe, "rm", ref], timeout=10, fail="docker rm %s failed: %s",
+                          fail_args=(ref[:12],), nonzero="docker rm %s returned %d: %s")
 
     def _inspect_containers(self, refs: list[str]) -> list[dict]:
         """``{"id", "name", "state", "labels", "mounts"}`` of each of the containers *refs* (names or ids) from
@@ -1216,18 +1211,19 @@ class DockerEnvironment(BaseEnvironment):
 
     def _is_ours(self, labels: dict) -> bool:
         """Labeled with our fingerprint, or — renamed from before canonical names, labels being
-        immutable — with the legacy one. Old shared-key containers carry no fingerprint label: one of
-        those is ours only when every other label matches, as the legacy lookup filtered them."""
+        immutable — with every label the legacy lookup filters on (no fingerprint under a shared key,
+        whose old containers carry none)."""
         fingerprint = labels.get(_ENVIRONMENT_LABEL_KEY)
-        if fingerprint is None:
-            return self._legacy_fingerprint is None and all(
-                labels.get(key) == value for key, value in self._labels.items() if key != _ENVIRONMENT_LABEL_KEY)
-        return fingerprint in (self._labels[_ENVIRONMENT_LABEL_KEY], self._legacy_fingerprint)
+        return fingerprint == self._labels[_ENVIRONMENT_LABEL_KEY] or (
+            fingerprint == self._legacy_fingerprint and self._legacy_labels.items() <= labels.items())
+
+    def _name_holder(self) -> dict | None:
+        return next(iter(self._inspect_containers([self._name])), None)
 
     def _named_container(self) -> tuple[str, str] | None:
         """``(id, state)`` of the container holding our name, ``None`` when there is none. The name is
         derived from our fingerprint, so a holder labeled with another one is not ours: refuse."""
-        data = next(iter(self._inspect_containers([self._name])), None)
+        data = self._name_holder()
         if data is None:
             return None
         if not self._is_ours(data["labels"]):
@@ -1244,8 +1240,8 @@ class DockerEnvironment(BaseEnvironment):
         recovery, every sibling's spawn — finds it by name. Its labels stay as they are, so
         label-keyed tooling (orphan reaper, lab wake) still resolves it. A failed rename means a
         sibling renamed it first: the name holder decides."""
-        # ponytail: legacy-names shim (with _legacy_fingerprint, _is_ours' second value and
-        # _find_legacy_container) — delete once pre-canonical-name containers have aged out.
+        # ponytail: legacy-names shim (with _legacy_fingerprint, _legacy_labels, _is_ours' second value
+        # and _find_legacy_container) — delete once pre-canonical-name containers have aged out.
         legacy = self._find_legacy_container()
         if legacy is None:
             return None
@@ -1425,8 +1421,7 @@ class DockerEnvironment(BaseEnvironment):
         reused after ``hermes egress disable`` (baked-in proxy env and CA mounts), and every
         container this class creates carries the label. The ``{{.Label "key"}}`` template
         function is Docker-only — podman ps exits 125 on it — so the probe never uses it (#99213)."""
-        labels = {**self._labels, _ENVIRONMENT_LABEL_KEY: self._legacy_fingerprint}
-        filters = [arg for key, value in labels.items() if value for arg in ("--filter", f"label={key}={value}")]
+        filters = [arg for key, value in self._legacy_labels.items() for arg in ("--filter", f"label={key}={value}")]
         result = _docker_query(
             [self._docker_exe, "ps", "-a", *filters, "--format", "{{.ID}}\t{{.State}}"], timeout=10,
             fail="docker ps probe failed: %s — will start a fresh container",

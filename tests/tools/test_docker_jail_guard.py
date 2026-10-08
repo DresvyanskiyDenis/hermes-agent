@@ -58,9 +58,9 @@ class _FakeDaemon:
 
     def created_by(self, cmd, *, cidfile: bool) -> str:
         """A container the ``docker run`` *cmd* created but never started, its id in the cidfile or not."""
-        cid = self.add(cmd[cmd.index("--name") + 1], _run_labels(cmd), state="created")
+        cid = self.add(_flag_value(cmd, "--name"), _run_labels(cmd), state="created")
         if cidfile:
-            Path(cmd[cmd.index("--cidfile") + 1]).write_text(cid)
+            Path(_flag_value(cmd, "--cidfile")).write_text(cid)
         return cid
 
     def find(self, ref):
@@ -111,14 +111,14 @@ class _FakeDaemon:
         if sub == "run":
             if self.run_hook is not None:
                 return self.run_hook(cmd)
-            name = cmd[cmd.index("--name") + 1]
+            name = _flag_value(cmd, "--name")
             if (holder := self.find(name) or self.reserved.get(name)) is not None:
                 return _name_conflict(name, holder)
             specs = [spec.split(":") for spec in _flag_values(cmd, "-v")]
             binds = [(spec[0], spec[1], spec[2:] != ["ro"]) for spec in specs]
             cid = self.add(name, _run_labels(cmd), binds=binds, image=cmd[-3],
                            network="none" if "--network=none" in cmd else "bridge")
-            Path(cmd[cmd.index("--cidfile") + 1]).write_text(cid)
+            Path(_flag_value(cmd, "--cidfile")).write_text(cid)
             if self.create_window > 0:
                 self.reserved[name] = cid
                 timer = threading.Timer(self.create_window, self._create, (name, cid, self.containers.pop(cid)))
@@ -171,6 +171,10 @@ _real_popen_bash = docker_env._popen_bash
 
 def _flag_values(cmd, flag):
     return [cmd[i + 1] for i, arg in enumerate(cmd) if arg == flag]
+
+
+def _flag_value(cmd, flag):
+    return cmd[cmd.index(flag) + 1]
 
 
 def _run_labels(cmd):
@@ -379,16 +383,15 @@ def test_conflict_holder_that_never_appears_raises_without_removing(daemon, monk
 def test_failed_run_spares_a_siblings_created_container(daemon):
     """A run that failed before its create (pull error) has no container: the name holder is a
     sibling's still-Created one, which the old cleanup by name removed."""
-    siblings = []
-
     def pull_fails_while_a_sibling_creates(cmd):
-        siblings.append(daemon.created_by(cmd, cidfile=False))
+        daemon.created_by(cmd, cidfile=False)
         return 125, "", "docker: Error response from daemon: manifest unknown"
 
     daemon.run_hook = pull_fails_while_a_sibling_creates
     with pytest.raises(subprocess.CalledProcessError):
         _spawn()
-    assert daemon.containers[siblings[0]]["state"] == "created"
+    (sibling,) = daemon.containers.values()
+    assert sibling["state"] == "created"
     assert not daemon.subcommands("rm")
 
 
@@ -418,23 +421,21 @@ def test_failed_run_removes_its_own_created_container(daemon, timed_out):
 def test_conflict_leg_never_removes_the_siblings_container(daemon, sibling, ours, reason):
     """The recreate guards remove a stale holder on attach, but a holder that wins our own ``docker
     run`` is a sibling's live container: the loser names the mismatch and leaves it running."""
-    won = []
-
     def sibling_wins(cmd):
-        name = cmd[cmd.index("--name") + 1]
-        won.append(daemon.add(name, _run_labels(cmd), **sibling))
-        return _name_conflict(name, won[0])
+        name = _flag_value(cmd, "--name")
+        return _name_conflict(name, daemon.add(name, _run_labels(cmd), **sibling))
 
     daemon.run_hook = sibling_wins
     with pytest.raises(RuntimeError, match="sibling process won the name race") as raised:
         _spawn(**ours)
-    assert f"{won[0][:12]} {reason}" in str(raised.value)
-    assert daemon.containers[won[0]]["state"] == "running"
+    (won,) = daemon.containers
+    assert f"{won[:12]} {reason}" in str(raised.value)
+    assert daemon.containers[won]["state"] == "running"
     assert not daemon.subcommands("rm")
 
 
 def test_session_scoped_name_conflict_does_not_blame_a_sibling(daemon):
-    daemon.run_hook = lambda cmd: _name_conflict(cmd[cmd.index("--name") + 1], "f" * 64)
+    daemon.run_hook = lambda cmd: _name_conflict(_flag_value(cmd, "--name"), "f" * 64)
 
     with pytest.raises(RuntimeError, match="random name is already held by another container") as raised:
         _spawn(persist_across_processes=False)
@@ -442,15 +443,19 @@ def test_session_scoped_name_conflict_does_not_blame_a_sibling(daemon):
     assert not daemon.subcommands("rm")
 
 
-def test_name_holder_of_another_identity_refuses(daemon):
-    """The name is derived from the fingerprint, so a holder labeled otherwise is not ours."""
-    probe = _spawn()
+@pytest.mark.parametrize("shared_key", ["", "team"], ids=["labeled-otherwise", "label-less-of-another-task"])
+def test_name_holder_of_another_identity_refuses(daemon, shared_key):
+    """The name is derived from the fingerprint, so a holder labeled otherwise is not ours — nor,
+    under a shared key, a label-less one whose other labels are not the legacy lookup's."""
+    probe = _spawn(shared_container_key=shared_key)
+    labels = _foreign_labels() if not shared_key else {
+        **{k: v for k, v in probe._labels.items() if k != "hermes-environment"}, "hermes-task-id": "other"}
     daemon.containers.clear()
-    daemon.add(probe._name, _foreign_labels())
+    daemon.add(probe._name, labels)
     daemon.calls.clear()
 
-    with pytest.raises(RuntimeError, match=f"{probe._name}.*{'f' * 24}"):
-        _spawn()
+    with pytest.raises(RuntimeError, match=f"Refusing to use container {probe._name}"):
+        _spawn(shared_container_key=shared_key)
     assert not daemon.subcommands("run", "rename", "rm")
 
 

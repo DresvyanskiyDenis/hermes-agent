@@ -448,8 +448,8 @@ def test_snap_compat_drops_only_init_and_no_new_privileges(monkeypatch):
     assert "--init" not in compat and "no-new-privileges" not in compat
 
     def strip(argv):  # everything except the two flags and the per-spawn container name and cidfile
-        argv = [a for a, prev in zip(argv, ["", *argv]) if prev != "--cidfile"]
-        return [a for a in argv if a not in ("--init", "--security-opt", "no-new-privileges") and not a.startswith("hermes-")]
+        return [a for a in argv if a not in ("--init", "--security-opt", "no-new-privileges")
+                and not a.startswith("hermes-") and "hermes-cid-" not in a]
 
     assert strip(default) == strip(compat)
 
