@@ -1107,15 +1107,16 @@ class DockerEnvironment(BaseEnvironment):
             logger.warning("Docker: could not pull %s: %s", self._image, e)
             return False
 
-    def _run_command(self, name: str, workdir: str) -> list[str]:
+    def _run_command(self, name: str, workdir: str, cidfile: str) -> list[str]:
         """``docker run -d`` argv for a fresh ``sleep infinity`` container (idle reaper handles
-        lifetime). s6-overlay images already provide PID 1, so ``--init`` is skipped for them."""
+        lifetime), writing its id to *cidfile* at create. s6-overlay images already provide PID 1,
+        so ``--init`` is skipped for them."""
         label_args = [arg for k, v in self._labels.items() for arg in ("--label", f"{k}={v}")]
         return [
             # tini/catatonit as PID 1 reaps zombie children — but s6-overlay images already provide their
             # own /init PID 1, so adding --init there creates two competing inits and breaks startup
             # (#34628).
-            self._docker_exe, "run", "-d",
+            self._docker_exe, "run", "-d", "--cidfile", cidfile,
             *([] if self._image_uses_s6_init or self._snap_compat else ["--init"]),
             "--name", name,
             *label_args,
@@ -1129,11 +1130,9 @@ class DockerEnvironment(BaseEnvironment):
         test: a sibling process with the same configuration that won the race makes ``docker run``
         fail "already in use", and its container is then ours too: the loser waits for it to become
         inspectable and attaches, never removing by name — a plain ``rm`` succeeds on the sibling's
-        still-"Created" container. Any other failure (exit 125, timeout mid-pull) can leave a "Created"
-        orphan the exited-only reaper never catches, so it is removed by name before re-raising — with
-        a plain ``rm``: the daemon refuses that on a running container, which the name may by now be
-        held by."""
-        run_cmd = self._run_command(self._name, cwd)
+        still-"Created" container. Any other failure is cleaned up by ``_remove_failed_run``."""
+        cid_dir = tempfile.mkdtemp(prefix="hermes-cid-")  # docker refuses a --cidfile that exists
+        run_cmd = self._run_command(self._name, cwd, os.path.join(cid_dir, "cid"))
         logger.debug("Starting container: %s", ' '.join(run_cmd))
         self._refuse_foreign_holders()
         try:
@@ -1154,13 +1153,37 @@ class DockerEnvironment(BaseEnvironment):
                 raise RuntimeError(
                     f"docker run {self._name}: a sibling won the name but its container never became "
                     f"inspectable within {_CONFLICT_ATTACH_TIMEOUT:g}s; not removing it.") from e
-            logger.warning("docker run failed for %s, cleaning up orphaned container: %s", self._name, e)
-            _docker_query([self._docker_exe, "rm", self._name], timeout=10,
-                          fail="docker rm %s failed: %s", fail_args=(self._name,))
+            self._remove_failed_run(os.path.join(cid_dir, "cid"), e)
             raise
+        finally:
+            shutil.rmtree(cid_dir, ignore_errors=True)
         container_id = result.stdout.strip()
         logger.info("Started container %s (%s)", self._name, container_id[:12])
         return container_id
+
+    def _remove_failed_run(self, cidfile: str, error: Exception) -> None:
+        """A failed run (exit 125, timeout mid-pull) can leave a "Created" orphan the exited-only reaper
+        never catches: remove exactly ours, the id docker wrote to *cidfile* at create. Without one, a
+        client that exited saw its create fail, so the name holder (a sibling's container in its
+        create-to-start window) is not ours; a client killed by the timeout may have had its create land
+        unseen, so only then is a Created holder of our identity removed. A plain ``rm`` either way: the
+        daemon refuses it on a container that is running by now."""
+        # ponytail: in that timeout window a sibling's Created container is indistinguishable by labels;
+        # a per-spawn nonce label would tell them apart if that window ever bites.
+        try:
+            with open(cidfile, encoding="utf-8") as f:
+                ref = f.read().strip()
+        except OSError:
+            ref = ""
+        if not ref and isinstance(error, subprocess.TimeoutExpired):
+            holder = next(iter(self._inspect_containers([self._name])), None)
+            if holder is not None and holder["state"] == "created" and self._is_ours(holder["labels"]):
+                ref = holder["id"]
+        if not ref:
+            logger.warning("docker run failed for %s, no container of ours to clean up: %s", self._name, error)
+            return
+        logger.warning("docker run failed for %s, cleaning up orphaned container %s: %s", self._name, ref[:12], error)
+        _docker_query([self._docker_exe, "rm", ref], timeout=10, fail="docker rm %s failed: %s", fail_args=(ref[:12],))
 
     def _inspect_containers(self, refs: list[str]) -> list[dict]:
         """``{"id", "state", "labels", "mounts"}`` of each of the containers *refs* (names or ids) from

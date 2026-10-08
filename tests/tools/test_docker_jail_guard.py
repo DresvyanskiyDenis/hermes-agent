@@ -35,6 +35,7 @@ class _FakeDaemon:
         self.timers: list[threading.Timer] = []
         self.calls: list[list[str]] = []
         self.run_barrier: threading.Barrier | None = None
+        self.run_hook = None  # cmd -> (rc, out, err) answering a ``docker run`` in place of the daemon
         self.start_error = ""
         self._lock = threading.Lock()
         monkeypatch.setenv("TERMINAL_SANDBOX_DIR", str(tmp_path / "sandboxes"))
@@ -46,13 +47,21 @@ class _FakeDaemon:
         monkeypatch.setattr(docker_env.subprocess, "run", self)
         monkeypatch.setattr(docker_env, "_popen_bash", self._exec)
 
-    def add(self, name, labels, *, binds=(), image="python:3.11") -> str:
+    def add(self, name, labels, *, binds=(), image="python:3.11", state="running") -> str:
         cid = uuid.uuid4().hex + uuid.uuid4().hex
         self.containers[cid] = {
-            "name": name, "labels": dict(labels), "state": "running", "image": image,
+            "name": name, "labels": dict(labels), "state": state, "image": image,
             "finished": "0001-01-01T00:00:00Z",
             "mounts": [{"Type": "bind" if src.startswith("/") else "volume", "Source": src,
                         "Destination": dst, "RW": rw} for src, dst, rw in binds]}
+        return cid
+
+    def created_by(self, cmd, *, cidfile: bool) -> str:
+        """A container the ``docker run`` *cmd* created but never started, its id in the cidfile or not."""
+        cid = self.add(cmd[cmd.index("--name") + 1], dict(label.split("=", 1) for label in _flag_values(cmd, "--label")),
+                       state="created")
+        if cidfile:
+            Path(cmd[cmd.index("--cidfile") + 1]).write_text(cid)
         return cid
 
     def find(self, ref):
@@ -101,6 +110,8 @@ class _FakeDaemon:
             with_state = "{{.State}}" in cmd[cmd.index("--format") + 1]
             return 0, "".join(f"{cid}\t{c['state']}\n" if with_state else f"{cid}\n" for cid, c in hits), ""
         if sub == "run":
+            if self.run_hook is not None:
+                return self.run_hook(cmd)
             name = cmd[cmd.index("--name") + 1]
             if (holder := self.find(name) or self.reserved.get(name)) is not None:
                 return 125, "", (f'docker: Error response from daemon: Conflict. The container name "/{name}" '
@@ -109,6 +120,7 @@ class _FakeDaemon:
             specs = [spec.split(":") for spec in _flag_values(cmd, "-v")]
             binds = [(spec[0], spec[1], spec[2:] != ["ro"]) for spec in specs]
             cid = self.add(name, labels, binds=binds, image=cmd[-3])
+            Path(cmd[cmd.index("--cidfile") + 1]).write_text(cid)
             if self.create_window > 0:
                 self.reserved[name] = cid
                 timer = threading.Timer(self.create_window, self._create, (name, cid, self.containers.pop(cid)))
@@ -341,6 +353,41 @@ def test_conflict_holder_that_never_appears_raises_without_removing(daemon, monk
 
     daemon.settle()
     assert daemon.containers[winner._container_id]["state"] == "running"
+
+
+def test_failed_run_spares_a_siblings_created_container(daemon):
+    """A run that failed before its create (pull error) has no container: the name holder is a
+    sibling's still-Created one, which the old cleanup by name removed."""
+    siblings = []
+
+    def pull_fails_while_a_sibling_creates(cmd):
+        siblings.append(daemon.created_by(cmd, cidfile=False))
+        return 125, "", "docker: Error response from daemon: manifest unknown"
+
+    daemon.run_hook = pull_fails_while_a_sibling_creates
+    with pytest.raises(subprocess.CalledProcessError):
+        _spawn()
+    assert daemon.containers[siblings[0]]["state"] == "created"
+    assert not daemon.subcommands("rm")
+
+
+@pytest.mark.parametrize("timed_out", [False, True], ids=["start-failed", "client-timed-out"])
+def test_failed_run_removes_its_own_created_container(daemon, timed_out):
+    """By the cidfile id when the create returned; by name only when the client died before seeing
+    it (timeout) and the holder is a Created container of our identity."""
+    ours = []
+
+    def run_fails_after_create(cmd):
+        ours.append(daemon.created_by(cmd, cidfile=not timed_out))
+        if timed_out:
+            raise subprocess.TimeoutExpired(cmd, 120)
+        return 125, "", "docker: Error response from daemon: failed to create task: mount source missing"
+
+    daemon.run_hook = run_fails_after_create
+    with pytest.raises((subprocess.CalledProcessError, subprocess.TimeoutExpired)):
+        _spawn()
+    assert not daemon.containers
+    assert [c[2:] for c in daemon.subcommands("rm")] == [ours]
 
 
 def test_name_holder_of_another_identity_refuses(daemon):

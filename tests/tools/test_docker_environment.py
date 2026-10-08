@@ -4,6 +4,7 @@ import re
 from io import StringIO
 import subprocess
 import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -446,7 +447,8 @@ def test_snap_compat_drops_only_init_and_no_new_privileges(monkeypatch):
     assert "--init" in default and "no-new-privileges" in default
     assert "--init" not in compat and "no-new-privileges" not in compat
 
-    def strip(argv):  # everything except the two flags and the random container name
+    def strip(argv):  # everything except the two flags and the per-spawn container name and cidfile
+        argv = [a for a, prev in zip(argv, ["", *argv]) if prev != "--cidfile"]
         return [a for a in argv if a not in ("--init", "--security-opt", "no-new-privileges") and not a.startswith("hermes-")]
 
     assert strip(default) == strip(compat)
@@ -1184,7 +1186,7 @@ def test_reuse_starts_stopped_container_before_attaching(monkeypatch):
 ], ids=["exit-125", "timeout-mid-pull"])
 def test_failed_docker_run_cleans_up_orphaned_container(monkeypatch, failure):
     """When ``docker run`` fails (exit 125, or a timeout on a slow image pull), the
-    partially-created container must be removed by name.
+    partially-created container must be removed by the id docker wrote to its cidfile.
 
     Docker can create the container object before failing to start it,
     leaving a stale ``Created`` container. The exited-only orphan reaper
@@ -1195,7 +1197,7 @@ def test_failed_docker_run_cleans_up_orphaned_container(monkeypatch, failure):
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
 
-    cleanup_calls, run_names = [], []
+    cleanup_calls = []
 
     def _run(cmd, **kwargs):
         if isinstance(cmd, list) and len(cmd) >= 2:
@@ -1203,7 +1205,7 @@ def test_failed_docker_run_cleans_up_orphaned_container(monkeypatch, failure):
             if sub == "version":
                 return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
             if sub == "run":
-                run_names.append(cmd[cmd.index("--name") + 1])
+                Path(cmd[cmd.index("--cidfile") + 1]).write_text("orphan-cid")
                 raise failure
             if sub == "rm":
                 cleanup_calls.append(list(cmd))
@@ -1215,9 +1217,8 @@ def test_failed_docker_run_cleans_up_orphaned_container(monkeypatch, failure):
     with pytest.raises(type(failure)):
         _make_dummy_env()
 
-    # Plain rm by the canonical name: the daemon refuses it if a sibling's running container holds it.
-    assert re.fullmatch(r"hermes-[0-9a-f]{12}", run_names[0])
-    assert cleanup_calls == [["/usr/bin/docker", "rm", run_names[0]]]
+    # Plain rm of exactly our container: never by the name a sibling may hold by now.
+    assert cleanup_calls == [["/usr/bin/docker", "rm", "orphan-cid"]]
 
 
 
