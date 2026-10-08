@@ -30,6 +30,9 @@ class _FakeDaemon:
 
     def __init__(self, monkeypatch, tmp_path):
         self.containers: dict[str, dict] = {}
+        self.create_window: float = 0.0  # name reserved, container not yet inspectable (daemon create)
+        self.reserved: dict[str, str] = {}
+        self.timers: list[threading.Timer] = []
         self.calls: list[list[str]] = []
         self.run_barrier: threading.Barrier | None = None
         self.start_error = ""
@@ -57,6 +60,16 @@ class _FakeDaemon:
 
     def stop(self, cid):
         self.containers[cid].update(state="exited", finished=_FINISHED_LONG_AGO)
+
+    def _create(self, name, cid, container):
+        with self._lock:
+            del self.reserved[name]
+            self.containers[cid] = container
+
+    def settle(self):
+        """Wait out every pending create window."""
+        for timer in self.timers:
+            timer.join()
 
     def subcommands(self, *subs):
         return [c for c in self.calls if c[1] in subs]
@@ -88,13 +101,19 @@ class _FakeDaemon:
             return 0, "".join(f"{cid}\t{c['state']}\n" if with_state else f"{cid}\n" for cid, c in hits), ""
         if sub == "run":
             name = cmd[cmd.index("--name") + 1]
-            if (holder := self.find(name)) is not None:
+            if (holder := self.find(name) or self.reserved.get(name)) is not None:
                 return 125, "", (f'docker: Error response from daemon: Conflict. The container name "/{name}" '
                                  f'is already in use by container "{holder}".')
             labels = dict(label.split("=", 1) for label in _flag_values(cmd, "--label"))
             specs = [spec.split(":") for spec in _flag_values(cmd, "-v")]
             binds = [(spec[0], spec[1], spec[2:] != ["ro"]) for spec in specs]
-            return 0, self.add(name, labels, binds=binds, image=cmd[-3]) + "\n", ""
+            cid = self.add(name, labels, binds=binds, image=cmd[-3])
+            if self.create_window > 0:
+                self.reserved[name] = cid
+                timer = threading.Timer(self.create_window, self._create, (name, cid, self.containers.pop(cid)))
+                self.timers.append(timer)
+                timer.start()
+            return 0, cid + "\n", ""
         if sub == "inspect" and cmd[2:4] == ["--type", "container"]:  # one JSON line per container found
             found = [cid for cid in map(self.find, cmd[cmd.index("--format") + 2:]) if cid is not None]
             out = "".join(json.dumps({"id": cid, **{k: self.containers[cid][k] for k in ("state", "labels", "mounts")}})
@@ -272,6 +291,48 @@ def test_cold_start_race_converges_on_one_container(daemon):
     assert len(daemon.containers) == 1
     assert {env._container_id for env in envs} == set(daemon.containers)
     assert len(daemon.subcommands("run")) == 2
+
+
+def test_cold_start_race_attaches_through_the_create_window(daemon):
+    """The daemon reserves the name before the winner's container is inspectable: the loser waits
+    for it and attaches, and never removes by name — a plain ``rm`` would take the winner's
+    still-created container (live scenario H, docker 29.1.3)."""
+    daemon.run_barrier = threading.Barrier(2)
+    daemon.create_window = 0.75
+    envs, errors = [], []
+
+    def spawn():
+        try:
+            envs.append(_spawn())
+        except Exception as e:  # surfaced by the assertion below
+            errors.append(e)
+
+    threads = [threading.Thread(target=spawn) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    daemon.settle()
+
+    assert not errors
+    assert len(daemon.containers) == 1
+    assert {env._container_id for env in envs} == set(daemon.containers)
+    assert len(daemon.subcommands("run")) == 2
+    assert not daemon.subcommands("rm")
+
+
+def test_conflict_holder_that_never_appears_raises_without_removing(daemon, monkeypatch):
+    """A name holder that stays uninspectable past the wait is a loud failure, never a removal."""
+    monkeypatch.setattr(docker_env, "_CONFLICT_ATTACH_TIMEOUT", 0.5)
+    daemon.create_window = 3.0
+    winner = _spawn()
+
+    with pytest.raises(RuntimeError, match=f"{winner._name}.*never became inspectable"):
+        _spawn()
+    assert not daemon.subcommands("rm")
+
+    daemon.settle()
+    assert daemon.containers[winner._container_id]["state"] == "running"
 
 
 def test_name_holder_of_another_identity_refuses(daemon):

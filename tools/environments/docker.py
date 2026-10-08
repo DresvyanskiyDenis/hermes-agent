@@ -48,6 +48,9 @@ _DOCKER_SEARCH_PATHS = [
 _docker_executable: Optional[str] = None  # resolved once, cached
 _ENV_VAR_NAME_RE = _SHELL_ENV_NAME_RE
 _ENVIRONMENT_LABEL_KEY = "hermes-environment"
+# How long the loser of a ``docker run --name`` race waits for the winner's container to become
+# inspectable: the daemon reserves the name ~1 s before the container exists.
+_CONFLICT_ATTACH_TIMEOUT = 30.0
 
 
 def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
@@ -1122,10 +1125,13 @@ class DockerEnvironment(BaseEnvironment):
     def _docker_run(self, cwd: str) -> str:
         """Start our container under its name and return its id. The name is the atomic duplicate
         test: a sibling process with the same configuration that won the race makes ``docker run``
-        fail "already in use", and its container is then ours too. Any other failure (exit 125,
-        timeout mid-pull) can leave a "Created" orphan the exited-only reaper never catches, so it is
-        removed by name before re-raising — with a plain ``rm``: the daemon refuses that on a running
-        container, which the name may by now be held by."""
+        fail "already in use", and its container is then ours too. The daemon reserves the name before
+        that container is inspectable, so the loser polls the holder until it appears and attaches;
+        it never removes by name on a conflict — the name is the sibling's, and a plain ``rm`` succeeds
+        on its still-"Created" container. Any other failure (exit 125, timeout mid-pull) can leave a
+        "Created" orphan the exited-only reaper never catches, so it is removed by name before
+        re-raising — with a plain ``rm``: the daemon refuses that on a running container, which the
+        name may by now be held by."""
         run_cmd = self._run_command(self._name, cwd)
         logger.debug("Starting container: %s", ' '.join(run_cmd))
         self._refuse_foreign_holders()
@@ -1134,10 +1140,19 @@ class DockerEnvironment(BaseEnvironment):
                 run_cmd, timeout=120, check=True,  # image pull may take a while
                 env=self._docker_client_env(self._run_env_values))
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            if (isinstance(e, subprocess.CalledProcessError) and "already in use" in (e.stderr or "")
-                    and (container_id := self._attach_existing_container())):
-                logger.info("Container name %s was taken by a sibling process — attached", self._name)
-                return container_id
+            conflict = isinstance(e, subprocess.CalledProcessError) and "already in use" in (e.stderr or "")
+            if conflict:
+                # A session-scoped name is a fresh uuid: a holder of it is foreign, never ours to wait for.
+                if self._persist_across_processes:
+                    deadline = time.monotonic() + _CONFLICT_ATTACH_TIMEOUT
+                    while self._named_container() is None and time.monotonic() < deadline:
+                        time.sleep(0.25)
+                    if container_id := self._attach_existing_container():
+                        logger.info("Container name %s was taken by a sibling process — attached", self._name)
+                        return container_id
+                raise RuntimeError(
+                    f"docker run {self._name}: a sibling won the name but its container never became "
+                    f"inspectable within {_CONFLICT_ATTACH_TIMEOUT:g}s; not removing it.") from e
             logger.warning("docker run failed for %s, cleaning up orphaned container: %s", self._name, e)
             _docker_query([self._docker_exe, "rm", self._name], timeout=10,
                           fail="docker rm %s failed: %s", fail_args=(self._name,))
