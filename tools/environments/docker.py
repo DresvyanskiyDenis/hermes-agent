@@ -5,7 +5,6 @@ resource limits (CPU, memory, disk), and optional filesystem persistence via
 bind mounts.
 """
 
-import contextlib
 import datetime
 import hashlib
 import json
@@ -49,6 +48,8 @@ _DOCKER_SEARCH_PATHS = [
 _docker_executable: Optional[str] = None  # resolved once, cached
 _ENV_VAR_NAME_RE = _SHELL_ENV_NAME_RE
 _ENVIRONMENT_LABEL_KEY = "hermes-environment"
+# Per-``docker run`` nonce: tells our failed run's orphan apart from a sibling's same-identity container.
+_SPAWN_LABEL_KEY = "hermes-spawn"
 # How long the loser of a ``docker run --name`` race waits for the winner's container to become
 # inspectable: the daemon reserves the name ~1 s before the container exists.
 _CONFLICT_ATTACH_TIMEOUT = 30.0
@@ -1114,16 +1115,18 @@ class DockerEnvironment(BaseEnvironment):
             logger.warning("Docker: could not pull %s: %s", self._image, e)
             return False
 
-    def _run_command(self, name: str, workdir: str, cidfile: str) -> list[str]:
+    def _run_command(self, name: str, workdir: str, spawn_nonce: str) -> list[str]:
         """``docker run -d`` argv for a fresh ``sleep infinity`` container (idle reaper handles
-        lifetime), writing its id to *cidfile* at create. s6-overlay images already provide PID 1,
-        so ``--init`` is skipped for them."""
-        label_args = [arg for k, v in self._labels.items() for arg in ("--label", f"{k}={v}")]
+        lifetime), labeled with *spawn_nonce* so a failed run finds exactly its own container; the
+        nonce is outside ``self._labels``, so never part of identity. s6-overlay images already
+        provide PID 1, so ``--init`` is skipped for them."""
+        label_args = [arg for k, v in {**self._labels, _SPAWN_LABEL_KEY: spawn_nonce}.items()
+                      for arg in ("--label", f"{k}={v}")]
         return [
             # tini/catatonit as PID 1 reaps zombie children — but s6-overlay images already provide their
             # own /init PID 1, so adding --init there creates two competing inits and breaks startup
             # (#34628).
-            self._docker_exe, "run", "-d", "--cidfile", cidfile,
+            self._docker_exe, "run", "-d",
             *([] if self._image_uses_s6_init or self._snap_compat else ["--init"]),
             "--name", name,
             *label_args,
@@ -1139,52 +1142,45 @@ class DockerEnvironment(BaseEnvironment):
         inspectable and attaches, never removing by name — a plain ``rm`` succeeds on the sibling's
         still-"Created" container. Any other failure is cleaned up by ``_remove_failed_run``."""
         self._refuse_foreign_holders()
-        with tempfile.TemporaryDirectory(prefix="hermes-cid-") as cid_dir:
-            cidfile = os.path.join(cid_dir, "cid")  # docker refuses a --cidfile that exists
-            run_cmd = self._run_command(self._name, cwd, cidfile)
-            logger.debug("Starting container: %s", ' '.join(run_cmd))
-            try:
-                result = run_capture(
-                    run_cmd, timeout=120, check=True,  # image pull may take a while
-                    env=self._docker_client_env(self._run_env_values))
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-                conflict = isinstance(e, subprocess.CalledProcessError) and "already in use" in (e.stderr or "")
-                if conflict:
-                    deadline = time.monotonic() + _CONFLICT_ATTACH_TIMEOUT
-                    # A session-scoped name is a fresh uuid: a holder of it is foreign, never ours to wait for.
-                    while (self._persist_across_processes and self._named_container() is None
-                           and time.monotonic() < deadline):
-                        time.sleep(0.25)
-                    if container_id := self._attach_existing_container(conflict=True):
-                        logger.info("Container name %s was taken by a sibling process — attached", self._name)
-                        return container_id
-                    raise RuntimeError(
-                        f"docker run {self._name}: a sibling won the name but its container never became "
-                        f"inspectable within {_CONFLICT_ATTACH_TIMEOUT:g}s; not removing it."
-                        if self._persist_across_processes else
-                        f"docker run {self._name}: this session's random name is already held by another "
-                        "container; not removing it.") from e
-                self._remove_failed_run(cidfile, e)
-                raise
+        spawn_nonce = uuid.uuid4().hex
+        run_cmd = self._run_command(self._name, cwd, spawn_nonce)
+        logger.debug("Starting container: %s", ' '.join(run_cmd))
+        try:
+            result = run_capture(
+                run_cmd, timeout=120, check=True,  # image pull may take a while
+                env=self._docker_client_env(self._run_env_values))
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            conflict = isinstance(e, subprocess.CalledProcessError) and "already in use" in (e.stderr or "")
+            if conflict:
+                deadline = time.monotonic() + _CONFLICT_ATTACH_TIMEOUT
+                # A session-scoped name is a fresh uuid: a holder of it is foreign, never ours to wait for.
+                while (self._persist_across_processes and self._named_container() is None
+                       and time.monotonic() < deadline):
+                    time.sleep(0.25)
+                if container_id := self._attach_existing_container(conflict=True):
+                    logger.info("Container name %s was taken by a sibling process — attached", self._name)
+                    return container_id
+                raise RuntimeError(
+                    f"docker run {self._name}: a sibling won the name but its container never became "
+                    f"inspectable within {_CONFLICT_ATTACH_TIMEOUT:g}s; not removing it."
+                    if self._persist_across_processes else
+                    f"docker run {self._name}: this session's random name is already held by another "
+                    "container; not removing it.") from e
+            self._remove_failed_run(spawn_nonce, e)
+            raise
         container_id = result.stdout.strip()
         logger.info("Started container %s (%s)", self._name, container_id[:12])
         return container_id
 
-    def _remove_failed_run(self, cidfile: str, error: Exception) -> None:
+    def _remove_failed_run(self, spawn_nonce: str, error: Exception) -> None:
         """A failed run (exit 125, timeout mid-pull) can leave a "Created" orphan the exited-only reaper
-        never catches: remove exactly ours, the id docker wrote to *cidfile* at create. Without one, a
-        client that exited saw its create fail, so the name holder is a sibling's; only a client killed
-        by the timeout may have had its create land unseen. A plain ``rm``: the daemon refuses it on a
-        container that is running by now."""
-        # ponytail: in that timeout window a sibling's Created container is indistinguishable by labels;
-        # a per-spawn nonce label would tell them apart if that window ever bites.
-        ref = ""
-        with contextlib.suppress(OSError):
-            ref = Path(cidfile).read_text(encoding="utf-8").strip()
-        if not ref and isinstance(error, subprocess.TimeoutExpired):
-            holder = self._name_holder()
-            if holder is not None and holder["state"] == "created" and self._is_ours(holder["labels"]):
-                ref = holder["id"]
+        never catches: remove exactly ours, the container carrying *spawn_nonce* — a sibling's carries
+        its own. A plain ``rm``: the daemon refuses it on a container that is running by now."""
+        listing = _docker_query(
+            [self._docker_exe, "ps", "-a", "--filter", f"label={_SPAWN_LABEL_KEY}={spawn_nonce}", "--format", "{{.ID}}"],
+            timeout=10, fail="docker ps for spawn %s failed: %s", fail_args=(spawn_nonce,),
+            nonzero="docker ps for spawn %s returned %d: %s")
+        ref = next(iter(listing.stdout.split()), "") if listing is not None else ""
         logger.warning("docker run failed for %s (orphaned container: %s): %s", self._name, ref[:12] or "none", error)
         if ref:
             _docker_query([self._docker_exe, "rm", ref], timeout=10, fail="docker rm %s failed: %s",

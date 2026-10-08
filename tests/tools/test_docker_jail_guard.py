@@ -56,12 +56,9 @@ class _FakeDaemon:
                         "Destination": dst, "RW": rw} for src, dst, rw in binds]}
         return cid
 
-    def created_by(self, cmd, *, cidfile: bool) -> str:
-        """A container the ``docker run`` *cmd* created but never started, its id in the cidfile or not."""
-        cid = self.add(_flag_value(cmd, "--name"), _run_labels(cmd), state="created")
-        if cidfile:
-            Path(_flag_value(cmd, "--cidfile")).write_text(cid)
-        return cid
+    def created_by(self, cmd, **labels) -> str:
+        """A container the ``docker run`` *cmd* created but never started, *labels* overriding its own."""
+        return self.add(_flag_value(cmd, "--name"), {**_run_labels(cmd), **labels}, state="created")
 
     def find(self, ref):
         return next((cid for cid, c in self.containers.items() if ref in (c["name"], cid[:len(ref)])), None)
@@ -118,7 +115,6 @@ class _FakeDaemon:
             binds = [(spec[0], spec[1], spec[2:] != ["ro"]) for spec in specs]
             cid = self.add(name, _run_labels(cmd), binds=binds, image=cmd[-3],
                            network="none" if "--network=none" in cmd else "bridge")
-            Path(_flag_value(cmd, "--cidfile")).write_text(cid)
             if self.create_window > 0:
                 self.reserved[name] = cid
                 timer = threading.Timer(self.create_window, self._create, (name, cid, self.containers.pop(cid)))
@@ -322,9 +318,9 @@ def test_spawn_runs_under_the_canonical_name_with_every_label(daemon):
 
     container = daemon.containers[daemon.find(env._name)]
     assert env._name == docker_env._canonical_container_name(env._labels["hermes-environment"])
-    assert container["labels"] == env._labels
+    assert container["labels"] == {**env._labels, "hermes-spawn": container["labels"]["hermes-spawn"]}
     assert container["labels"].keys() == {
-        "hermes-agent", "hermes-task-id", "hermes-profile", "hermes-egress", "hermes-environment"}
+        "hermes-agent", "hermes-task-id", "hermes-profile", "hermes-egress", "hermes-environment", "hermes-spawn"}
 
 
 def test_respawn_attaches_by_name_and_starts_a_stopped_container(daemon):
@@ -382,9 +378,10 @@ def test_conflict_holder_that_never_appears_raises_without_removing(daemon, monk
 
 def test_failed_run_spares_a_siblings_created_container(daemon):
     """A run that failed before its create (pull error) has no container: the name holder is a
-    sibling's still-Created one, which the old cleanup by name removed."""
+    sibling's still-Created one of the same identity but another spawn nonce, which the old cleanup
+    by name removed."""
     def pull_fails_while_a_sibling_creates(cmd):
-        daemon.created_by(cmd, cidfile=False)
+        daemon.created_by(cmd, **{"hermes-spawn": uuid.uuid4().hex})
         return 125, "", "docker: Error response from daemon: manifest unknown"
 
     daemon.run_hook = pull_fails_while_a_sibling_creates
@@ -397,12 +394,11 @@ def test_failed_run_spares_a_siblings_created_container(daemon):
 
 @pytest.mark.parametrize("timed_out", [False, True], ids=["start-failed", "client-timed-out"])
 def test_failed_run_removes_its_own_created_container(daemon, timed_out):
-    """By the cidfile id when the create returned; by name only when the client died before seeing
-    it (timeout) and the holder is a Created container of our identity."""
+    """By its spawn nonce, whether the create returned or the client died before seeing it (timeout)."""
     ours = []
 
     def run_fails_after_create(cmd):
-        ours.append(daemon.created_by(cmd, cidfile=not timed_out))
+        ours.append(daemon.created_by(cmd))
         if timed_out:
             raise subprocess.TimeoutExpired(cmd, 120)
         return 125, "", "docker: Error response from daemon: failed to create task: mount source missing"
@@ -412,6 +408,20 @@ def test_failed_run_removes_its_own_created_container(daemon, timed_out):
         _spawn()
     assert not daemon.containers
     assert [c[2:] for c in daemon.subcommands("rm")] == [ours]
+
+
+def test_spawn_nonce_labels_only_the_run(daemon):
+    """Each ``docker run`` carries its own nonce label and no host cidfile (a snap client's private
+    /tmp cannot see one); the nonce stays out of identity, so the canonical name is unchanged."""
+    first = _spawn()
+    daemon.containers.clear()
+    second = _spawn()
+
+    runs = daemon.subcommands("run")
+    assert all("--cidfile" not in cmd for cmd in runs)
+    nonces = [[v for v in _flag_values(cmd, "--label") if v.startswith("hermes-spawn=")] for cmd in runs]
+    assert all(len(n) == 1 for n in nonces) and nonces[0] != nonces[1]
+    assert first._name == second._name and "hermes-spawn" not in second._labels
 
 
 @pytest.mark.parametrize("sibling, ours, reason", [
