@@ -15,7 +15,8 @@
 #   G': a respawn that adds a named volume is a new fingerprint, so a new name: the stale container
 #      is neither adopted nor removed (it is the orphan reaper's once it exits).
 #   H: two concurrent spawns of one configuration converge on exactly one container, and both
-#      processes can exec in it.
+#      processes can exec in it. Exactly one racer must log the sibling attach, or the spawns
+#      serialized and the race was never exercised: retried, then a failure, never a pass.
 set -u
 cd "$(dirname "$0")/.."
 PY=${HERMES_PYTHON:-.venv/bin/python}
@@ -75,10 +76,10 @@ same_container() { [ -n "$1" ] && [ "$1" = "$2" ]; }
 
 running() { [ "$(docker inspect --format '{{.State.Running}}' "$1" 2>/dev/null)" = true ]; }
 
-canonical_name() {  # prints the container's name, failing unless it is hermes-<fp12>
+canonical_name() {  # prints the container's name; non-zero (reason on stderr) unless it is hermes-<fp12>
   local name
-  name=$(docker inspect --format '{{.Name}}' "$1") || fail "cannot inspect $1"
-  [[ $name =~ ^/hermes-[0-9a-f]{12}$ ]] || fail "container $1 is named $name, not hermes-<fp12>"
+  name=$(docker inspect --format '{{.Name}}' "$1") || { echo "cannot inspect $1" >&2; return 1; }
+  [[ $name =~ ^/hermes-[0-9a-f]{12}$ ]] || { echo "container $1 is named $name, not hermes-<fp12>" >&2; return 1; }
   echo "${name#/}"
 }
 
@@ -110,7 +111,7 @@ expect_refusal() {  # expect_refusal <scenario> <holder id> <spawn output>
 # A: one configuration, two processes, one container under the canonical name.
 id1=$(spawn default "$A:/home/bot") || fail "scenario A default spawn crashed"
 case "$id1" in REFUSED*) fail "scenario A default spawn refused: $id1" ;; esac
-canonical_name "$id1" >/dev/null
+canonical_name "$id1" >/dev/null || fail "scenario A container is not canonically named"
 id2=$(spawn default "$A:/home/bot") || fail "scenario A respawn crashed"
 same_container "$id1" "$id2" || fail "respawn got $id2, not the named container $id1"
 echo "PASS respawn-attaches-by-name"
@@ -194,7 +195,7 @@ read -r idA idB aliveA aliveB <<<"$out"
 printf '%s\n' "$idA" "$idB" >>"$CREATED_IDS"
 [ "$aliveA" = True ] && [ "$aliveB" = True ] || fail "exec after recovery did not run in both envs: $out"
 same_container "$idA" "$idB" || fail "B recovered into $idB, not A's recreated container $idA: $out"
-canonical_name "$idA" >/dev/null
+canonical_name "$idA" >/dev/null || fail "scenario F recreated container is not canonically named"
 echo "PASS no-host-volume-twin-recovers-by-name"
 assert_single_jail "$T/sbxF/docker/default/home" "$T/sbxF/docker/default/workspace"
 
@@ -205,7 +206,9 @@ idOld=$(spawn default) || fail "scenario G' default spawn crashed"
 idG=$(spawn default "$GVOL:/data") || fail "scenario G' drifted spawn crashed: $idG"
 case "$idG" in REFUSED*) fail "named-volume drift shares only sandbox dirs, got: $idG" ;; esac
 [ "$idG" != "$idOld" ] || fail "drifted config adopted the stale container $idOld"
-[ "$(canonical_name "$idG")" != "$(canonical_name "$idOld")" ] || fail "drifted config kept the stale name"
+nameG=$(canonical_name "$idG") || fail "scenario G' drifted container is not canonically named"
+nameOld=$(canonical_name "$idOld") || fail "scenario G' stale container is not canonically named"
+[ "$nameG" != "$nameOld" ] || fail "drifted config kept the stale name $nameOld"
 running "$idOld" || fail "drift spawn stopped or removed the stale container $idOld"
 docker inspect --format '{{range .Mounts}}{{.Type}}:{{.Destination}}{{"\n"}}{{end}}' "$idG" | grep -qx volume:/data \
   || fail "new container $idG does not carry the named volume"
@@ -213,27 +216,39 @@ echo "PASS fingerprint-drift-gets-new-name"
 
 # H: two processes of one configuration spawn at the same instant (both probe before either runs);
 # the name makes `docker run` the atomic duplicate test, so the loser attaches to the winner.
-export TERMINAL_SANDBOX_DIR=$T/sbxH GO_AT=$(($(date +%s) + 3))
-race() {
+race() {  # race <attempt> <racer>
   "$PY" -c '
-import os, time
+import logging, os, sys, time
 from tools.environments.docker import DockerEnvironment
+logging.basicConfig(level=logging.INFO, stream=sys.stderr)  # the loser logs its sibling attach
 time.sleep(max(0.0, int(os.environ["GO_AT"]) - time.time()))
 env = DockerEnvironment(image=os.environ["IMAGE"], cwd="/", task_id="default", volumes=[], persistent_filesystem=True)
 with open(os.environ["CREATED_IDS"], "a") as f:
     f.write(env._container_id + "\n")
-print(env._container_id, "alive" in env.execute("echo alive").get("output", ""))' >"$T/race.$1" 2>"$T/race.$1.err"
+print(env._container_id, "alive" in env.execute("echo alive").get("output", ""))' >"$T/race.$1.$2" 2>"$T/race.$1.$2.err"
 }
-race 1 & pid1=$!
-race 2 & pid2=$!
-wait "$pid1" || fail "scenario H racer 1 crashed: $(tail -5 "$T/race.1.err")"
-wait "$pid2" || fail "scenario H racer 2 crashed: $(tail -5 "$T/race.2.err")"
-read -r idH1 aliveH1 <"$T/race.1"
-read -r idH2 aliveH2 <"$T/race.2"
-same_container "$idH1" "$idH2" || fail "racers got $idH1 / $idH2, not one container"
-[ "$aliveH1" = True ] && [ "$aliveH2" = True ] || fail "exec failed in a racer: $aliveH1 / $aliveH2"
-n=$(holders "$T/sbxH/docker/default/home" -a)
-[ "$n" = 1 ] || fail "$n containers (any state) mount the raced sandbox (want 1)"
-echo "PASS concurrent-spawn-converges"
+raced=
+for attempt in 1 2 3; do
+  # A fresh sandbox root per attempt is a fresh fingerprint, so a fresh name to race for.
+  export TERMINAL_SANDBOX_DIR=$T/sbxH$attempt GO_AT=$(($(date +%s) + 3))
+  race "$attempt" 1 & pid1=$!
+  race "$attempt" 2 & pid2=$!
+  wait "$pid1" || fail "scenario H racer 1 crashed: $(tail -5 "$T/race.$attempt.1.err")"
+  wait "$pid2" || fail "scenario H racer 2 crashed: $(tail -5 "$T/race.$attempt.2.err")"
+  read -r idH1 aliveH1 <"$T/race.$attempt.1"
+  read -r idH2 aliveH2 <"$T/race.$attempt.2"
+  same_container "$idH1" "$idH2" || fail "racers got $idH1 / $idH2, not one container"
+  [ "$aliveH1" = True ] && [ "$aliveH2" = True ] || fail "exec failed in a racer: $aliveH1 / $aliveH2"
+  n=$(holders "$TERMINAL_SANDBOX_DIR/docker/default/home" -a)
+  [ "$n" = 1 ] || fail "$n containers (any state) mount the raced sandbox (want 1)"
+  attached=$(grep -l "was taken by a sibling process" "$T/race.$attempt".[12].err | wc -l)
+  case "$attached" in
+    1) raced=$attempt; break ;;
+    0) echo "scenario H attempt $attempt: spawns serialized (no sibling attach logged), retrying" ;;
+    *) fail "scenario H: both racers logged the sibling attach" ;;
+  esac
+done
+[ -n "$raced" ] || { echo "FAIL scenario H: race not exercised (spawns serialized)"; exit 1; }
+echo "PASS concurrent-spawn-converges (race fired on attempt $raced)"
 
 echo "ALL PASS"
