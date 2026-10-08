@@ -127,7 +127,8 @@ class _FakeDaemon:
             return 0, cid + "\n", ""
         if sub == "inspect" and cmd[2:4] == ["--type", "container"]:  # one JSON line per container found
             found = [cid for cid in map(self.find, cmd[cmd.index("--format") + 2:]) if cid is not None]
-            out = "".join(json.dumps({"id": cid, **{k: self.containers[cid][k] for k in ("state", "labels", "mounts")}})
+            out = "".join(json.dumps({"id": cid, "name": "/" + self.containers[cid]["name"],
+                                      **{k: self.containers[cid][k] for k in ("state", "labels", "mounts")}})
                           + "\n" for cid in found)
             return (0 if len(found) == len(cmd) - cmd.index("--format") - 2 else 1), out, ""
         cid = self.find(ref)
@@ -487,6 +488,32 @@ def test_another_identity_holding_a_real_rw_path_refuses(daemon, tmp_path, holde
     assert not daemon.subcommands("run")
 
 
+def test_same_fingerprint_under_another_name_holding_a_real_rw_path_refuses(daemon, tmp_path):
+    """Only the holder of our name is ours to attach: a same-identity container left under another
+    name (a failed legacy rename) is a second writer of the jail like any other."""
+    jail = _jail(tmp_path)
+    probe = _spawn(volumes=[f"{jail}:/home/bot"])
+    daemon.containers.clear()
+    twin = daemon.add("hermes-1a2b3c4d", probe._labels, binds=[(jail, "/home/bot", True)])
+    daemon.calls.clear()
+
+    with pytest.raises(RuntimeError, match=f"{jail}.*{twin[:12]}"):
+        _spawn(volumes=[f"{jail}:/home/bot"])
+    assert not daemon.subcommands("run")
+
+
+def test_label_less_container_is_not_ours_under_a_shared_key(daemon, tmp_path):
+    """Under a shared key there is no legacy fingerprint: a container without one (any other key's
+    pre-canonical container) is not ours, so its RW jail path refuses."""
+    jail = _jail(tmp_path)
+    labels = _foreign_labels(**{"hermes-profile": "other_key-0123456789ab"})
+    del labels["hermes-environment"]
+    holder = daemon.add("hermes-holder", labels, binds=[(jail, "/home/bot", True)])
+
+    with pytest.raises(RuntimeError, match=f"{jail}.*{holder[:12]}"):
+        _spawn(volumes=[f"{jail}:/home/bot"], shared_container_key="team")
+
+
 @pytest.mark.parametrize("holder_rw, ours", [(False, ":/home/bot"), (True, ":/home/bot:ro")], ids=["theirs-ro", "ours-ro"])
 def test_read_only_side_never_conflicts(daemon, tmp_path, holder_rw, ours):
     jail = _jail(tmp_path)
@@ -574,6 +601,20 @@ def test_legacy_container_is_adopted_by_label_and_renamed(daemon):
     assert by_label.stdout.split() == [legacy]
     # The renamed holder carries the legacy label: the next process attaches by name, no refusal.
     assert _spawn()._container_id == legacy
+
+
+def test_legacy_shared_key_container_is_adopted_and_stays_ours(daemon):
+    """Pre-canonical shared-key containers carry no fingerprint label: after the rename the holder of
+    our name is still recognised by its other labels, so the next process attaches, not refuses."""
+    probe = _spawn(shared_container_key="team")
+    labels = {k: v for k, v in probe._labels.items() if k != "hermes-environment"}
+    daemon.containers.clear()
+    legacy = daemon.add("hermes-1a2b3c4d", labels)
+
+    assert _spawn(shared_container_key="team")._container_id == legacy
+    assert daemon.containers[legacy]["name"] == probe._name
+    assert _spawn(shared_container_key="team")._container_id == legacy
+    assert len(daemon.subcommands("run")) == 1  # the probe's own
 
 
 # --- mount parsing --------------------------------------------------------------------------

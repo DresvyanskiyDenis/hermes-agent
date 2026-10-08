@@ -1070,9 +1070,10 @@ class DockerEnvironment(BaseEnvironment):
     def _refuse_foreign_holders(self) -> None:
         """Before our container comes up (run or start): refuse when a running hermes container of
         another identity bind-mounts read-write a real host path we bind read-write — two sandbox
-        configurations writing one tree. Containers of our identity are ours to attach, a read-only
-        side never conflicts, and probe failures proceed: this must never brick startup. A
-        session-scoped container shares nothing by name, so it is not probed."""
+        configurations writing one tree. Only the holder of our canonical name is ours to attach: a
+        same-fingerprint container under another name (a failed legacy rename) is probed like any
+        other. A read-only side never conflicts, and probe failures proceed: this must never brick
+        startup. A session-scoped container shares nothing by name, so it is not probed."""
         if not self._persist_across_processes:
             return
         root = _persistent_sandbox_root()
@@ -1087,7 +1088,7 @@ class DockerEnvironment(BaseEnvironment):
         if result is None or not result.stdout.split():
             return
         for holder in self._inspect_containers(result.stdout.split()):
-            if self._is_ours(holder["labels"]):
+            if holder["name"] == self._name:
                 continue
             cid = holder["id"]
             binds = [(m.get("Source", ""), m.get("Destination", ""), m.get("RW") is True)
@@ -1197,18 +1198,19 @@ class DockerEnvironment(BaseEnvironment):
         _docker_query([self._docker_exe, "rm", ref], timeout=10, fail="docker rm %s failed: %s", fail_args=(ref[:12],))
 
     def _inspect_containers(self, refs: list[str]) -> list[dict]:
-        """``{"id", "state", "labels", "mounts"}`` of each of the containers *refs* (names or ids) from
+        """``{"id", "name", "state", "labels", "mounts"}`` of each of the containers *refs* (names or ids) from
         ONE inspect. A ref that is gone or unreadable is left out; docker still prints the others."""
         result = _docker_query(
             [self._docker_exe, "inspect", "--type", "container", "--format",
-             '{"id":{{json .Id}},"state":{{json .State.Status}},"labels":{{json .Config.Labels}},'
+             '{"id":{{json .Id}},"name":{{json .Name}},"state":{{json .State.Status}},"labels":{{json .Config.Labels}},'
              '"mounts":{{json .Mounts}}}', *refs], timeout=10,
             fail="docker inspect %s failed: %s", fail_args=(refs,))
         containers = []
         for line in result.stdout.splitlines() if result is not None else ():
             try:
                 data = json.loads(line)
-                containers.append({"id": data["id"], "state": data["state"], "labels": dict(data["labels"] or {}),
+                containers.append({"id": data["id"], "name": data["name"].lstrip("/"), "state": data["state"],
+                                   "labels": dict(data["labels"] or {}),
                                    "mounts": list(data["mounts"] or [])})
             except (ValueError, TypeError, KeyError):
                 logger.debug("docker inspect %s: unreadable output %r", refs, line)
@@ -1216,8 +1218,13 @@ class DockerEnvironment(BaseEnvironment):
 
     def _is_ours(self, labels: dict) -> bool:
         """Labeled with our fingerprint, or — renamed from before canonical names, labels being
-        immutable — with the legacy one (none under a shared key, whose old containers had none)."""
-        return labels.get(_ENVIRONMENT_LABEL_KEY) in (self._labels[_ENVIRONMENT_LABEL_KEY], self._legacy_fingerprint)
+        immutable — with the legacy one. Old shared-key containers carry no fingerprint label: one of
+        those is ours only when every other label matches, as the legacy lookup filtered them."""
+        fingerprint = labels.get(_ENVIRONMENT_LABEL_KEY)
+        if fingerprint is None:
+            return self._legacy_fingerprint is None and all(
+                labels.get(key) == value for key, value in self._labels.items() if key != _ENVIRONMENT_LABEL_KEY)
+        return fingerprint in (self._labels[_ENVIRONMENT_LABEL_KEY], self._legacy_fingerprint)
 
     def _named_container(self) -> tuple[str, str] | None:
         """``(id, state)`` of the container holding our name, ``None`` when there is none. The name is
