@@ -47,10 +47,10 @@ class _FakeDaemon:
         monkeypatch.setattr(docker_env.subprocess, "run", self)
         monkeypatch.setattr(docker_env, "_popen_bash", self._exec)
 
-    def add(self, name, labels, *, binds=(), image="python:3.11", state="running") -> str:
+    def add(self, name, labels, *, binds=(), image="python:3.11", state="running", network="bridge") -> str:
         cid = uuid.uuid4().hex + uuid.uuid4().hex
         self.containers[cid] = {
-            "name": name, "labels": dict(labels), "state": state, "image": image,
+            "name": name, "labels": dict(labels), "state": state, "image": image, "network": network,
             "finished": "0001-01-01T00:00:00Z",
             "mounts": [{"Type": "bind" if src.startswith("/") else "volume", "Source": src,
                         "Destination": dst, "RW": rw} for src, dst, rw in binds]}
@@ -58,8 +58,7 @@ class _FakeDaemon:
 
     def created_by(self, cmd, *, cidfile: bool) -> str:
         """A container the ``docker run`` *cmd* created but never started, its id in the cidfile or not."""
-        cid = self.add(cmd[cmd.index("--name") + 1], dict(label.split("=", 1) for label in _flag_values(cmd, "--label")),
-                       state="created")
+        cid = self.add(cmd[cmd.index("--name") + 1], _run_labels(cmd), state="created")
         if cidfile:
             Path(cmd[cmd.index("--cidfile") + 1]).write_text(cid)
         return cid
@@ -114,12 +113,11 @@ class _FakeDaemon:
                 return self.run_hook(cmd)
             name = cmd[cmd.index("--name") + 1]
             if (holder := self.find(name) or self.reserved.get(name)) is not None:
-                return 125, "", (f'docker: Error response from daemon: Conflict. The container name "/{name}" '
-                                 f'is already in use by container "{holder}".')
-            labels = dict(label.split("=", 1) for label in _flag_values(cmd, "--label"))
+                return _name_conflict(name, holder)
             specs = [spec.split(":") for spec in _flag_values(cmd, "-v")]
             binds = [(spec[0], spec[1], spec[2:] != ["ro"]) for spec in specs]
-            cid = self.add(name, labels, binds=binds, image=cmd[-3])
+            cid = self.add(name, _run_labels(cmd), binds=binds, image=cmd[-3],
+                           network="none" if "--network=none" in cmd else "bridge")
             Path(cmd[cmd.index("--cidfile") + 1]).write_text(cid)
             if self.create_window > 0:
                 self.reserved[name] = cid
@@ -140,6 +138,8 @@ class _FakeDaemon:
             fmt = cmd[cmd.index("--format") + 1]
             if fmt == "{{.State.FinishedAt}}":
                 return 0, c["finished"] + "\n", ""
+            if fmt == "{{.HostConfig.NetworkMode}}":
+                return 0, c["network"] + "\n", ""
             assert fmt == "{{.Config.Image}}", fmt
             return 0, c["image"] + "\n", ""
         if sub == "rename":
@@ -170,6 +170,15 @@ _real_popen_bash = docker_env._popen_bash
 
 def _flag_values(cmd, flag):
     return [cmd[i + 1] for i, arg in enumerate(cmd) if arg == flag]
+
+
+def _run_labels(cmd):
+    return dict(label.split("=", 1) for label in _flag_values(cmd, "--label"))
+
+
+def _name_conflict(name, holder):
+    return 125, "", (f'docker: Error response from daemon: Conflict. The container name "/{name}" '
+                     f'is already in use by container "{holder}".')
 
 
 @pytest.fixture
@@ -388,6 +397,37 @@ def test_failed_run_removes_its_own_created_container(daemon, timed_out):
         _spawn()
     assert not daemon.containers
     assert [c[2:] for c in daemon.subcommands("rm")] == [ours]
+
+
+@pytest.mark.parametrize("sibling, ours, reason", [
+    ({"image": "python:3.10"}, {"image_pinned": True}, "runs image python:3.10 but docker_image is python:3.11"),
+    ({"network": "bridge"}, {"network": False}, "has NetworkMode=bridge but docker_network=false"),
+], ids=["pinned-image", "air-gap"])
+def test_conflict_leg_never_removes_the_siblings_container(daemon, sibling, ours, reason):
+    """The recreate guards remove a stale holder on attach, but a holder that wins our own ``docker
+    run`` is a sibling's live container: the loser names the mismatch and leaves it running."""
+    won = []
+
+    def sibling_wins(cmd):
+        name = cmd[cmd.index("--name") + 1]
+        won.append(daemon.add(name, _run_labels(cmd), **sibling))
+        return _name_conflict(name, won[0])
+
+    daemon.run_hook = sibling_wins
+    with pytest.raises(RuntimeError, match="sibling process won the name race") as raised:
+        _spawn(**ours)
+    assert f"{won[0][:12]} {reason}" in str(raised.value)
+    assert daemon.containers[won[0]]["state"] == "running"
+    assert not daemon.subcommands("rm")
+
+
+def test_session_scoped_name_conflict_does_not_blame_a_sibling(daemon):
+    daemon.run_hook = lambda cmd: _name_conflict(cmd[cmd.index("--name") + 1], "f" * 64)
+
+    with pytest.raises(RuntimeError, match="random name is already held by another container") as raised:
+        _spawn(persist_across_processes=False)
+    assert "sibling" not in str(raised.value)
+    assert not daemon.subcommands("rm")
 
 
 def test_name_holder_of_another_identity_refuses(daemon):

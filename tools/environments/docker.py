@@ -984,25 +984,62 @@ class DockerEnvironment(BaseEnvironment):
             logger.debug("Skipping docker cwd mount: /workspace already mounted by user config")
         return volume_args, writable_args
 
-    def _attach_existing_container(self) -> str | None:
+    def _attach_existing_container(self, *, conflict: bool = False) -> str | None:
         """Id of the existing container of our identity (the holder of our canonical name, else a
         pre-canonical-name one found by label), started unless running; ``None`` when a fresh one
-        must run, always for a session-scoped container. Network guard is lockdown-only: a bridge container under ``docker_network: false``
-        is removed and recreated, but a ``none`` container under default config is kept so
-        ``--network=none`` in extra args doesn't churn containers every startup."""
+        must run, always for a session-scoped container. A holder ``_recreate_reason`` rejects is
+        removed so a fresh one can run — except on the *conflict* leg of our own ``docker run``,
+        where the holder is a sibling's just-won container: that raises, never removes."""
         if not self._persist_across_processes:
             return None
-        existing = self._named_container() or self._adopt_legacy_container()
+        existing = self._named_container() if conflict else (
+            self._named_container() or self._adopt_legacy_container())
         if existing is None:
             return None
         container_id, state = existing
         task_label, profile_name = self._labels["hermes-task-id"], self._labels["hermes-profile"]
-        # A container built from another image. Explicitly configured image (config.yaml /
-        # TERMINAL_DOCKER_IMAGE): the user changed it, so the old container is not their sandbox any
-        # more — recreate (the image is immutable after creation). Default image: a default flip
-        # (nikolaik base -> hermes-sandbox:desktop) must not replace a sandbox someone has state in;
-        # keep it and let the CLI / Screen pane ask. Same rule Modal (snapshot wins) and Daytona
-        # (labeled sandbox wins) already apply.
+        if reason := self._recreate_reason(container_id):
+            if conflict:
+                raise RuntimeError(
+                    f"docker run {self._name}: a sibling process won the name race, but its container "
+                    f"{container_id[:12]} {reason}. Not removing a sibling's container: align the two "
+                    f"configurations or remove it (`docker rm -f {self._name}`) and retry.")
+            logger.warning("Existing container %s %s — removing it and starting fresh (task=%s, profile=%s).",
+                           container_id[:12], reason, task_label, profile_name)
+            try:
+                run_capture([self._docker_exe, "rm", "-f", container_id], timeout=30)
+            except (subprocess.TimeoutExpired, OSError) as e:
+                logger.warning("Failed to remove mismatched container %s: %s", container_id[:12], e)
+            return None
+
+        if state != "running":
+            self._refuse_foreign_holders()
+            try:
+                run_capture([self._docker_exe, "start", container_id], timeout=30, check=True)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                # The name is taken, so there is no fresh container to fall back to.
+                raise RuntimeError(
+                    f"Could not start sandbox container {self._name} ({container_id[:12]}, state={state}): "
+                    f"{e.stderr.strip() if isinstance(e.stderr, str) and e.stderr.strip() else e}") from e
+        logger.info(
+            "Reusing container %s (task=%s, profile=%s, prior state=%s)",
+            container_id[:12], task_label, profile_name, state)
+        return container_id
+
+    def _recreate_reason(self, container_id: str) -> str | None:
+        """Why the existing container must give way to a fresh one, or ``None`` to keep it.
+
+        A container built from another image. Explicitly configured image (config.yaml /
+        TERMINAL_DOCKER_IMAGE): the user changed it, so the old container is not their sandbox any
+        more — recreate (the image is immutable after creation). Default image: a default flip
+        (nikolaik base -> hermes-sandbox:desktop) must not replace a sandbox someone has state in;
+        keep it and let the CLI / Screen pane ask. Same rule Modal (snapshot wins) and Daytona
+        (labeled sandbox wins) already apply.
+
+        Network guard is lockdown-only: a bridge container under ``docker_network: false`` is
+        recreated, but a ``none`` container under default config is kept so ``--network=none`` in
+        extra args doesn't churn containers every startup."""
+        task_label, profile_name = self._labels["hermes-task-id"], self._labels["hermes-profile"]
         actual_image = self._container_image(container_id)
         if actual_image is not None and actual_image != self._image:
             if not self._image_pinned:
@@ -1022,42 +1059,13 @@ class DockerEnvironment(BaseEnvironment):
                     "pulled — keeping the current sandbox until it can (task=%s, profile=%s).",
                     container_id[:12], actual_image, self._image, task_label, profile_name)
             else:
-                logger.warning(
-                    "Existing container %s runs image %s but docker_image is %s — removing it and "
-                    "starting fresh (task=%s, profile=%s).",
-                    container_id[:12], actual_image, self._image, task_label, profile_name)
-                try:
-                    run_capture([self._docker_exe, "rm", "-f", container_id], timeout=30)
-                except (subprocess.TimeoutExpired, OSError) as e:
-                    logger.warning("Failed to remove mismatched container %s: %s", container_id[:12], e)
-                return None
+                return f"runs image {actual_image} but docker_image is {self._image}"
         if not self._network:
             actual_mode = self._container_network_mode(container_id)
             if actual_mode != "none":
-                logger.warning(
-                    "Existing container %s has NetworkMode=%s but "
-                    "docker_network=false requests an air-gapped "
-                    "container — removing it and starting fresh (task=%s, profile=%s).",
-                    container_id[:12], actual_mode or "unknown", task_label, profile_name)
-                try:
-                    run_capture([self._docker_exe, "rm", "-f", container_id], timeout=30)
-                except (subprocess.TimeoutExpired, OSError) as e:
-                    logger.warning("Failed to remove mismatched container %s: %s", container_id[:12], e)
-                return None
-
-        if state != "running":
-            self._refuse_foreign_holders()
-            try:
-                run_capture([self._docker_exe, "start", container_id], timeout=30, check=True)
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-                # The name is taken, so there is no fresh container to fall back to.
-                raise RuntimeError(
-                    f"Could not start sandbox container {self._name} ({container_id[:12]}, state={state}): "
-                    f"{e.stderr.strip() if isinstance(e.stderr, str) and e.stderr.strip() else e}") from e
-        logger.info(
-            "Reusing container %s (task=%s, profile=%s, prior state=%s)",
-            container_id[:12], task_label, profile_name, state)
-        return container_id
+                return (f"has NetworkMode={actual_mode or 'unknown'} but docker_network=false requests "
+                        "an air-gapped container")
+        return None
 
     def _refuse_foreign_holders(self) -> None:
         """Before our container comes up (run or start): refuse when a running hermes container of
@@ -1147,12 +1155,15 @@ class DockerEnvironment(BaseEnvironment):
                 while (self._persist_across_processes and self._named_container() is None
                        and time.monotonic() < deadline):
                     time.sleep(0.25)
-                if container_id := self._attach_existing_container():
+                if container_id := self._attach_existing_container(conflict=True):
                     logger.info("Container name %s was taken by a sibling process — attached", self._name)
                     return container_id
                 raise RuntimeError(
                     f"docker run {self._name}: a sibling won the name but its container never became "
-                    f"inspectable within {_CONFLICT_ATTACH_TIMEOUT:g}s; not removing it.") from e
+                    f"inspectable within {_CONFLICT_ATTACH_TIMEOUT:g}s; not removing it."
+                    if self._persist_across_processes else
+                    f"docker run {self._name}: this session's random name is already held by another "
+                    "container; not removing it.") from e
             self._remove_failed_run(os.path.join(cid_dir, "cid"), e)
             raise
         finally:
