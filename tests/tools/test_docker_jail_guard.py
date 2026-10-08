@@ -63,13 +63,14 @@ class _FakeDaemon:
 
     def _create(self, name, cid, container):
         with self._lock:
-            del self.reserved[name]
-            self.containers[cid] = container
+            if self.reserved.pop(name, None) is not None:  # not already created by its timer
+                self.containers[cid] = container
 
     def settle(self):
-        """Wait out every pending create window."""
+        """End every pending create window now."""
         for timer in self.timers:
-            timer.join()
+            timer.cancel()
+            self._create(*timer.args)
 
     def subcommands(self, *subs):
         return [c for c in self.calls if c[1] in subs]
@@ -167,6 +168,24 @@ def daemon(monkeypatch, tmp_path):
 def _spawn(**kwargs):
     kwargs = {"image": "python:3.11", "task_id": "default", "persistent_filesystem": True, "volumes": [], **kwargs}
     return docker_env.DockerEnvironment(**kwargs)
+
+
+def _race_two_spawns():
+    """``(envs, errors)`` of two concurrent spawns; errors are surfaced by the caller's assertions."""
+    envs, errors = [], []
+
+    def spawn():
+        try:
+            envs.append(_spawn())
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=spawn) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    return envs, errors
 
 
 def _jail(tmp_path):
@@ -273,19 +292,7 @@ def test_cold_start_race_converges_on_one_container(daemon):
     """Two processes of one configuration probe before either runs: one ``docker run`` wins the
     name, the loser's fails "already in use" and it attaches to the winner's container."""
     daemon.run_barrier = threading.Barrier(2)
-    envs, errors = [], []
-
-    def spawn():
-        try:
-            envs.append(_spawn())
-        except Exception as e:  # surfaced by the assertion below
-            errors.append(e)
-
-    threads = [threading.Thread(target=spawn) for _ in range(2)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=30)
+    envs, errors = _race_two_spawns()
 
     assert not errors
     assert len(daemon.containers) == 1
@@ -299,19 +306,7 @@ def test_cold_start_race_attaches_through_the_create_window(daemon):
     still-created container (live scenario H, docker 29.1.3)."""
     daemon.run_barrier = threading.Barrier(2)
     daemon.create_window = 0.75
-    envs, errors = [], []
-
-    def spawn():
-        try:
-            envs.append(_spawn())
-        except Exception as e:  # surfaced by the assertion below
-            errors.append(e)
-
-    threads = [threading.Thread(target=spawn) for _ in range(2)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=30)
+    envs, errors = _race_two_spawns()
     daemon.settle()
 
     assert not errors

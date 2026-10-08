@@ -1125,13 +1125,12 @@ class DockerEnvironment(BaseEnvironment):
     def _docker_run(self, cwd: str) -> str:
         """Start our container under its name and return its id. The name is the atomic duplicate
         test: a sibling process with the same configuration that won the race makes ``docker run``
-        fail "already in use", and its container is then ours too. The daemon reserves the name before
-        that container is inspectable, so the loser polls the holder until it appears and attaches;
-        it never removes by name on a conflict — the name is the sibling's, and a plain ``rm`` succeeds
-        on its still-"Created" container. Any other failure (exit 125, timeout mid-pull) can leave a
-        "Created" orphan the exited-only reaper never catches, so it is removed by name before
-        re-raising — with a plain ``rm``: the daemon refuses that on a running container, which the
-        name may by now be held by."""
+        fail "already in use", and its container is then ours too: the loser waits for it to become
+        inspectable and attaches, never removing by name — a plain ``rm`` succeeds on the sibling's
+        still-"Created" container. Any other failure (exit 125, timeout mid-pull) can leave a "Created"
+        orphan the exited-only reaper never catches, so it is removed by name before re-raising — with
+        a plain ``rm``: the daemon refuses that on a running container, which the name may by now be
+        held by."""
         run_cmd = self._run_command(self._name, cwd)
         logger.debug("Starting container: %s", ' '.join(run_cmd))
         self._refuse_foreign_holders()
@@ -1142,14 +1141,14 @@ class DockerEnvironment(BaseEnvironment):
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             conflict = isinstance(e, subprocess.CalledProcessError) and "already in use" in (e.stderr or "")
             if conflict:
+                deadline = time.monotonic() + _CONFLICT_ATTACH_TIMEOUT
                 # A session-scoped name is a fresh uuid: a holder of it is foreign, never ours to wait for.
-                if self._persist_across_processes:
-                    deadline = time.monotonic() + _CONFLICT_ATTACH_TIMEOUT
-                    while self._named_container() is None and time.monotonic() < deadline:
-                        time.sleep(0.25)
-                    if container_id := self._attach_existing_container():
-                        logger.info("Container name %s was taken by a sibling process — attached", self._name)
-                        return container_id
+                while (self._persist_across_processes and self._named_container() is None
+                       and time.monotonic() < deadline):
+                    time.sleep(0.25)
+                if container_id := self._attach_existing_container():
+                    logger.info("Container name %s was taken by a sibling process — attached", self._name)
+                    return container_id
                 raise RuntimeError(
                     f"docker run {self._name}: a sibling won the name but its container never became "
                     f"inspectable within {_CONFLICT_ATTACH_TIMEOUT:g}s; not removing it.") from e
