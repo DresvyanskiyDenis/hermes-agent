@@ -276,6 +276,17 @@ def test_tmpfs_sandboxes_of_distinct_tasks_get_distinct_names(daemon):
     assert _spawn(task_id="rollout:one", persistent_filesystem=False)._container_id == one._container_id
 
 
+def test_egress_posture_reaches_the_name(daemon, monkeypatch):
+    """The constructor feeds the egress posture into the fingerprint: a container with baked-in proxy
+    env and CA mounts must not be attached once egress is turned off, or the reverse."""
+    names = set()
+    for posture in ("off", "0123456789abcdef01234567"):
+        monkeypatch.setattr(docker_env, "_egress_reuse_fingerprint", lambda *_args, posture=posture: posture)
+        names.add(_spawn()._name)
+
+    assert len(names) == 2 and len(daemon.containers) == 2
+
+
 @pytest.mark.parametrize("persistent", [True, False], ids=["bind", "tmpfs"])
 def test_shared_key_keeps_task_buckets_apart(daemon, persistent):
     """A shared key shares a profile's container across profiles, not across task buckets: a per-task
@@ -468,6 +479,24 @@ def test_drift_runs_a_new_name_and_leaves_the_stale_container_to_the_reaper(daem
     daemon.stop(old._container_id)
     removed = docker_env.reap_orphan_containers(max_age_seconds=60, profile_filter="bot_1")
     assert removed == 1 and set(daemon.containers) == {new._container_id}
+
+
+@pytest.mark.parametrize("first, second, replaced", [
+    ({"shared_container_key": "team", "image": "python:3.10"},
+     {"shared_container_key": "team", "image_pinned": True}, ("image", "python:3.11")),
+    ({}, {"network": False}, ("network", "none")),
+], ids=["pinned-image", "air-gap"])
+def test_name_holder_failing_a_recreate_guard_is_replaced_under_the_name(daemon, first, second, replaced):
+    """The approved exceptions to "no replace", reached through the canonical-name holder: the image is
+    no fingerprint input under a shared key and the network mode never is, so the holder of our name
+    can be stale on either. It is removed and a fresh container runs under the same name."""
+    old = _spawn(**first)
+    new = _spawn(**second)
+
+    assert new._name == old._name and new._container_id != old._container_id
+    assert old._container_id not in daemon.containers
+    assert daemon.containers[new._container_id][replaced[0]] == replaced[1]
+    assert [c[2:] for c in daemon.subcommands("rm")] == [["-f", old._container_id]]
 
 
 # --- refusal --------------------------------------------------------------------------------
