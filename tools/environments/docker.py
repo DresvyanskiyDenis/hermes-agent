@@ -121,7 +121,7 @@ def _get_active_profile_name() -> str:
 
 
 def _container_identity(shared_key: str = "") -> str:
-    """Profile label used for container reuse and orphan reaping. Profiles are isolated by default; an
+    """``hermes-profile`` label value, which scopes orphan reaping. Profiles are isolated by default; an
     explicit shared key lets trusted profiles share one Docker identity. Label sanitization is lossy
     and reaping (and legacy-container lookup) is label-keyed, so a digest of the raw key disambiguates
     colliding keys. Plain profile names keep their historical un-suffixed labels."""
@@ -1029,12 +1029,10 @@ class DockerEnvironment(BaseEnvironment):
     def _recreate_reason(self, container_id: str) -> str | None:
         """Why the existing container must give way to a fresh one, or ``None`` to keep it.
 
-        A container built from another image. Explicitly configured image (config.yaml /
-        TERMINAL_DOCKER_IMAGE): the user changed it, so the old container is not their sandbox any
-        more — recreate (the image is immutable after creation). Default image: a default flip
-        (nikolaik base -> hermes-sandbox:desktop) must not replace a sandbox someone has state in;
-        keep it and let the CLI / Screen pane ask. Same rule Modal (snapshot wins) and Daytona
-        (labeled sandbox wins) already apply.
+        Image guard: a normal config hashes the image into the name, so a changed image is a new name
+        by construction; only a shared key (whose fingerprint omits the image) or an adopted
+        pre-canonical-name container holds our name under another image. A pinned image is recreated
+        once it is available; a default-image flip keeps the sandbox and logs how to approve it.
 
         Network guard is lockdown-only: a bridge container under ``docker_network: false`` is
         recreated, but a ``none`` container under default config is kept so ``--network=none`` in
