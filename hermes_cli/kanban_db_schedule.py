@@ -52,6 +52,10 @@ def wake_due_scheduled(conn: sqlite3.Connection, now: int) -> int:
     ).fetchall()
     for row in rows:
         task_id = row["id"]
+        _kb._reclaim_dangling_run(
+            conn, task_id, statuses=("scheduled",), now=now,
+            note="invariant recovery on scheduled wake",
+        )
         landing = _kb._landing_status_after_parents(conn, task_id)
         conn.execute(
             "UPDATE tasks SET status = ?, scheduled_until = NULL, current_run_id = NULL, "
