@@ -665,6 +665,7 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    scheduled_until: Optional[int] = None    # epoch wake deadline of a ``scheduled`` park
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -694,7 +695,7 @@ _TASK_REQUIRED_COLUMNS = (
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
-    "current_step_key", "max_retries", "session_id", "completion_contract",
+    "current_step_key", "max_retries", "session_id", "completion_contract", "scheduled_until",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -899,7 +900,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Wake deadline (epoch) set by ``schedule_task`` from ``--until`` / a
+    -- SCHEDULED_UNTIL marker; the dispatcher tick wakes due parks. NULL =
+    -- event-park, woken only by unblock.
+    scheduled_until      INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2059,8 +2064,9 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
 
 
 def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
-    """Promote ``todo``/``blocked`` tasks whose parents are all done/archived;
-    returns the count. Opens its own IMMEDIATE txn — call OUTSIDE any write txn.
+    """Wake due ``scheduled`` parks, then promote ``todo``/``blocked`` tasks whose
+    parents are all done/archived; returns the count. Opens its own IMMEDIATE
+    txn — call OUTSIDE any write txn.
 
     ``blocked`` is skipped when sticky (explicit ``kanban_block``) or when
     ``consecutive_failures`` reached the limit (else the breaker could never
@@ -2074,6 +2080,8 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
     with write_txn(conn):
+        # Before the todo scan so a wake landing in ``todo`` is promoted this call.
+        promoted += wake_due_scheduled(conn, int(time.time()))
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
@@ -3603,7 +3611,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # (the dispatcher's spawn/crash counter) IS reset — a deliberate unblock
         # is a fresh start for the retry budget.
         cur = conn.execute(
-            "UPDATE tasks SET status = ?, current_run_id = NULL, "
+            "UPDATE tasks SET status = ?, current_run_id = NULL, scheduled_until = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
         )
@@ -3882,35 +3890,6 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         _delete_task_relations(conn, task_id)
     recompute_ready(conn)
     return True
-
-
-def schedule_task(
-    conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
-    expected_run_id: Optional[int] = None,
-) -> bool:
-    """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
-    until ``unblock_task`` re-gates it."""
-    with write_txn(conn):
-        params: list[Any] = [task_id]
-        sql = """
-            UPDATE tasks
-               SET status       = 'scheduled',
-                   claim_lock   = NULL,
-                   claim_expires= NULL,
-                   worker_pid   = NULL
-             WHERE id = ?
-               AND status IN ('todo', 'ready', 'running', 'blocked')
-        """
-        if expected_run_id is not None:
-            sql += " AND current_run_id = ?"
-            params.append(int(expected_run_id))
-        if conn.execute(sql, params).rowcount != 1:
-            return False
-        run_id = _end_or_synthesize_run(
-            conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
-        )
-        _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
-        return True
 
 
 # --- Worker context builder (what a spawned worker sees) ---
@@ -4435,6 +4414,7 @@ from hermes_cli.kanban_db_workspace import (  # noqa: E402
     _managed_scratch_path_info,
     _scratch_workspace,
 )
+from hermes_cli.kanban_db_schedule import schedule_task, wake_due_scheduled  # noqa: E402
 from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     DEFAULT_FAILURE_LIMIT,
     DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
