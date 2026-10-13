@@ -438,7 +438,7 @@ def test_schedule_parks_current_worker_with_reason(worker_env):
     from tools import kanban_tools  # noqa: F401 — ensure registration
     from tools.registry import registry
 
-    reason = "SCHEDULED_UNTIL=2026-09-13T00:00:00Z waiting for reconnect"
+    reason = "waiting for reconnect"
     entry = registry.get_entry("kanban_schedule")
     assert entry is not None and entry.toolset == "kanban"
     out = json.loads(entry.handler({"reason": reason}))
@@ -455,6 +455,31 @@ def test_schedule_parks_current_worker_with_reason(worker_env):
             event.kind == "scheduled" and event.payload == {"reason": reason}
             for event in kb.list_events(conn, worker_env)
         )
+
+
+def test_schedule_until_persists_deadline(worker_env):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_schedule({"reason": "vendor", "until": "2026-10-14T09:30:00Z"}))
+
+    assert out["ok"] is True
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+    assert (task.status, task.scheduled_until) == ("scheduled", 1791970200)
+
+
+def test_schedule_rejects_unparseable_until(worker_env):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_schedule({"until": "next tuesday"}))
+
+    assert "unparseable until" in out["error"]
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
 
 
 def test_schedule_rejects_invalid_reason_and_unowned_contexts(monkeypatch, worker_env):

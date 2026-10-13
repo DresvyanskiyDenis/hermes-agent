@@ -255,3 +255,30 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+
+
+# ---------------------------------------------------------------------------
+# schedule --until (deadline-woken park)
+# ---------------------------------------------------------------------------
+
+def _kanban(argv: list[str]) -> int:
+    parser = kc.build_parser(argparse.ArgumentParser().add_subparsers(dest="_top"))
+    return kc.kanban_command(parser.parse_args(argv))
+
+
+def test_schedule_until_sets_deadline(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="wait", assignee="ops")
+    assert _kanban(["schedule", tid, "vendor", "--until", "2026-10-14T09:30:00+00:00"]) == 0
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert (task.status, task.scheduled_until) == ("scheduled", 1791970200)
+
+
+def test_schedule_bogus_until_exits_nonzero(kanban_home, capsys):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="wait", assignee="ops")
+    assert _kanban(["schedule", tid, "--until", "next tuesday"]) != 0
+    assert "unparseable until" in capsys.readouterr().err
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "ready"
