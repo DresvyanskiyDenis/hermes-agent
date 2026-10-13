@@ -87,6 +87,17 @@ def test_delivery_failure_is_an_open_failure(tmp_cron_home):
     assert sig["at"] == get_job(job_id)["last_run_at"]
 
 
+def test_delivery_queued_neither_opens_nor_clears_a_signal(tmp_cron_home):
+    job_id = create_job("queued digest", "every 24h")["id"]
+    assert mark_job_run(job_id, True, status="delivery_queued")
+    assert not _path(tmp_cron_home, job_id).exists()
+
+    assert mark_job_run(job_id, False, "boom")
+    before = _signal(tmp_cron_home, job_id)
+    assert mark_job_run(job_id, True, status="delivery_queued")
+    assert _signal(tmp_cron_home, job_id) == before
+
+
 @pytest.mark.parametrize("exc", [
     socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution"),
     _transport_death(),  # patch 0020: a mid-run transport death rides the same ladder

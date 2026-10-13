@@ -21,6 +21,11 @@ logger = logging.getLogger(__name__)
 
 SCHEMA = "cron-failure-signal/1"
 
+# Only terminal failures open a signal, matching the incident/watchdog contract. Transient
+# states (delivery_queued) are retried by the delivery queue itself; signalling them would
+# false-positive the watchdog.
+_OPEN_FAILURE_KINDS = frozenset({"error", "delivery_failed", "blocked_config"})
+
 
 def signal_path_for(job_id: str) -> Path:
     from cron.jobs import _current_cron_store  # late: cron.jobs imports this module lazily
@@ -77,14 +82,15 @@ def clear_failure_signal(job_id: str) -> None:
 
 def sync_after_run(job: Dict[str, Any], *, ladder_attempt: int) -> None:
     """Called by ``mark_job_run`` once the run outcome and ladder state are final: a green run
-    closes the open failure; any other status opens/overwrites it, unless an unreachable-model
-    re-run is parked (``plan_retry`` re-adds its state only when it parked one; the interim
-    rung stays silent like the failure notice)."""
+    closes the open failure; a terminal failure (``_OPEN_FAILURE_KINDS``) opens/overwrites it,
+    unless an unreachable-model re-run is parked (``plan_retry`` re-adds its state only when it
+    parked one; the interim rung stays silent like the failure notice); any other status leaves
+    a prior signal untouched."""
     from cron.unreachable_retry import STATE_KEY
 
     kind = job.get("last_status")
     if kind == "ok":
         clear_failure_signal(job["id"])
-    elif not job.get(STATE_KEY):
+    elif kind in _OPEN_FAILURE_KINDS and not job.get(STATE_KEY):
         write_failure_signal(job, job.get("last_error") or job.get("last_delivery_error"),
                              kind=kind, ladder_attempt=ladder_attempt)
