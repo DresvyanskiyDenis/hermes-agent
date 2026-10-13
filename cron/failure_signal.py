@@ -9,7 +9,6 @@ next green run. Existence == open failure; latest failure wins.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 from pathlib import Path
@@ -61,14 +60,9 @@ def write_failure_signal(job: Dict[str, Any], error_text: Optional[str], *, kind
     """Best-effort: never raises into the scheduler. ``ladder_attempt``: re-run rungs this
     failure had already spent; recorded only once the ladder is exhausted."""
     try:
-        from cron.jobs import _secure_dir, ensure_dirs
-
-        path = signal_path_for(job["id"])
-        ensure_dirs()
-        path.parent.mkdir(exist_ok=True)
-        _secure_dir(path.parent)
+        # atomic_write_text creates failures/ itself (never resurrecting a deleted profile home).
         payload = _signal_payload(job, error_text, kind, ladder_attempt)
-        atomic_write_text(path, json.dumps(payload, indent=2) + "\n",
+        atomic_write_text(signal_path_for(job["id"]), json.dumps(payload, indent=2) + "\n",
                           tmp_prefix=".failure_", mode=0o600)
     except Exception:  # best-effort: a signal must never break run accounting
         logger.debug("Failed to write failure signal for job %r", job.get("id"), exc_info=True)
@@ -76,8 +70,7 @@ def write_failure_signal(job: Dict[str, Any], error_text: Optional[str], *, kind
 
 def clear_failure_signal(job_id: str) -> None:
     try:
-        with contextlib.suppress(FileNotFoundError):
-            signal_path_for(job_id).unlink()
+        signal_path_for(job_id).unlink(missing_ok=True)
     except OSError as e:
         logger.debug("Failed to clear failure signal for job %r: %s", job_id, e)
 
@@ -94,4 +87,4 @@ def sync_after_run(job: Dict[str, Any], *, ladder_attempt: int) -> None:
         clear_failure_signal(job["id"])
     elif not job.get(STATE_KEY):
         write_failure_signal(job, job.get("last_error") or job.get("last_delivery_error"),
-                             kind=str(kind), ladder_attempt=ladder_attempt)
+                             kind=kind, ladder_attempt=ladder_attempt)

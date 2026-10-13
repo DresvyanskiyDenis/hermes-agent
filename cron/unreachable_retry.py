@@ -103,7 +103,7 @@ def _ladder_instant(job: Dict[str, Any], natural_next: Optional[datetime],
     parks nothing: not recurring, paused, disabled, ladder exhausted, or the schedule's
     own *natural_next* fires at or before the rung. The single source of that decision
     for ``plan_retry`` and ``will_retry``."""
-    attempt = int((job.get(STATE_KEY) or {}).get("attempt") or 0)
+    attempt = spent_rungs(job)
     if attempt >= len(RETRY_DELAYS_SECONDS) or not _ladder_applies(job):
         return None
     # late: jobs imports this module's helpers
@@ -132,6 +132,11 @@ def will_retry(job: Dict[str, Any]) -> bool:
         # leaves the record state=error — terminal — so plan_retry never runs either.
         return False
     return _ladder_instant(job, natural_next, now) is not None
+
+
+def spent_rungs(job: Dict[str, Any]) -> int:
+    """Re-runs already scheduled in the active ladder cycle (0 when none is active)."""
+    return int((job.get(STATE_KEY) or {}).get("attempt") or 0)
 
 
 def clear_state(job: Dict[str, Any]) -> None:
@@ -168,7 +173,7 @@ def plan_retry(job: Dict[str, Any]) -> bool:
     from cron.jobs import _parse_aware  # late: jobs imports this module's helpers
 
     retry_dt = _ladder_instant(job, _parse_aware(job.get("next_run_at")), _hermes_now())
-    attempt = int((job.get(STATE_KEY) or {}).get("attempt") or 0)
+    attempt = spent_rungs(job)
     if retry_dt is None:
         if attempt >= len(RETRY_DELAYS_SECONDS) and _ladder_applies(job):
             # Ladder exhausted: fall back to the natural schedule and reset so the NEXT

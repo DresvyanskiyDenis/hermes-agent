@@ -2499,10 +2499,10 @@ def mark_job_run(
         _advance_after_run(job, now, ladder_rung=ladder_rung)
         from cron import quota_hold
         from cron.failure_signal import sync_after_run
-        from cron.unreachable_retry import STATE_KEY, clear_state, plan_retry
+        from cron.unreachable_retry import clear_state, plan_retry, spent_rungs
 
         # Rungs this flagged failure had spent before plan_retry resets an exhausted ladder.
-        rungs_spent = int((job.get(STATE_KEY) or {}).get("attempt") or 0) if model_unreachable else 0
+        rungs_spent = spent_rungs(job) if model_unreachable else 0
         if not success and model_unreachable and not is_terminal_job(job):
             plan_retry(job)
         else:

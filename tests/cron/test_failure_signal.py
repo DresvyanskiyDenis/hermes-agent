@@ -25,8 +25,12 @@ def tmp_cron_home(tmp_path, monkeypatch):
     return home
 
 
+def _path(home, job_id):
+    return home / "cron" / "failures" / f"{job_id}.json"
+
+
 def _signal(home, job_id):
-    path = home / "cron" / "failures" / f"{job_id}.json"
+    path = _path(home, job_id)
     return json.loads(path.read_text()) if path.exists() else None
 
 
@@ -57,7 +61,7 @@ def test_failed_run_writes_signal_and_green_run_clears_it(tmp_cron_home):
         "next_run_at": job["next_run_at"],
         "retry_ladder": None,
     }
-    path = tmp_cron_home / "cron" / "failures" / f"{job_id}.json"
+    path = _path(tmp_cron_home, job_id)
     assert path.stat().st_mode & 0o777 == 0o600
 
     assert mark_job_run(job_id, False, error)
@@ -116,7 +120,7 @@ def test_secrets_are_redacted(tmp_cron_home):
     key = "sk-ant-api03-" + "A1b2C3d4E5f6G7h8I9j0" * 3
     job_id = create_job("leaky", "every 24h")["id"]
     assert mark_job_run(job_id, False, f"AuthenticationError: bad key {key}")
-    path = tmp_cron_home / "cron" / "failures" / f"{job_id}.json"
+    path = _path(tmp_cron_home, job_id)
     assert key not in path.read_text()
 
 
@@ -126,7 +130,7 @@ def test_signal_follows_the_active_cron_store(tmp_cron_home, tmp_path):
     with use_cron_store(other):
         job_id = create_job("work brief", "every 24h")["id"]
         assert mark_job_run(job_id, False, "boom")
-        assert fs.signal_path_for(job_id) == other / "cron" / "failures" / f"{job_id}.json"
+        assert fs.signal_path_for(job_id) == _path(other, job_id)
     assert _signal(other, job_id)["profile"] == "work"
     assert not (tmp_cron_home / "cron" / "failures").exists()
 
