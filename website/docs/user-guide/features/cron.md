@@ -463,6 +463,13 @@ cron:
   retry_unreachable: false   # default true; disables the automatic re-runs
 ```
 
+MID-RUN transport deaths (local patch 0020): when the run reached the model but then exhausted
+the in-turn retry/auto-recovery ladder on a transient verdict (timeout, overloaded, server
+error), it produced no deliverable either — the scheduler routes it into the same re-run ladder
+under the same `cron.retry_unreachable` switch. Unlike the zero-call case this re-run repeats
+whatever the failed attempt already did, so a job with non-idempotent side effects should keep
+the ladder off (`cron.retry_unreachable: false`) or be re-entrant.
+
 ### Holding a job through a closed provider usage window
 
 The mirror case: the provider says exactly how long it will stay closed. When

@@ -191,3 +191,49 @@ def test_ladder_reruns_do_not_spend_extra_repeat_budget(tmp_cron_home, monkeypat
     assert held == [True, True, True, False]
     # But a rung whose limit was edited down to the count does retire the job: send its notice.
     assert not ur.will_retry(dict(runs[1], repeat={"times": 1, "completed": 1}))
+
+
+class _AIAgentStub:
+    @staticmethod
+    def _format_turn_completion_explanation(*_a, **_kw):
+        return ""
+
+
+def _transport_death(failure_reason: str, api_calls: int) -> RuntimeError:
+    exc = RuntimeError("Hermes can't reach the model provider")
+    exc.failure_reason = failure_reason
+    exc.api_calls = api_calls
+    return exc
+
+
+def test_final_response_from_result_stamps_transport_verdict():
+    """The agent loop collapses the transport chain into a string; the raise must keep its
+    verdict and call count so the cron classifier can still see a mid-run transport death."""
+    result = {"failed": True, "error": "Hermes can't reach the model provider...",
+              "failure_reason": "timeout", "api_calls": 4, "final_response": "",
+              "turn_exit_reason": ""}
+    with pytest.raises(RuntimeError) as info:
+        sched._final_response_from_result(result, "j1", "j", _AIAgentStub)
+    assert info.value.failure_reason == "timeout"
+    assert info.value.api_calls == 4
+
+
+def test_midrun_transport_death_classifies_but_task_failure_does_not():
+    assert ur.is_midrun_transport_death_failure(_transport_death("timeout", 4))
+    assert not ur.is_midrun_transport_death_failure(_transport_death("", 4))
+    # Zero calls belongs to is_model_unreachable_failure's stricter spend-neutral gate.
+    assert not ur.is_midrun_transport_death_failure(_transport_death("timeout", 0))
+    assert not ur.is_midrun_transport_death_failure(_transport_death("content_policy_blocked", 9))
+
+
+def test_midrun_transport_death_shares_the_ladder(tmp_cron_home):
+    """The scheduler-visible contract: the flag alone drives the ladder, however the run died."""
+    job_id = create_job("weekly market watch", "every 24h")["id"]
+    now = datetime.now(timezone.utc)
+    assert mark_job_run(job_id, False, "RuntimeError: Hermes can't reach the model provider",
+                        model_unreachable=True)
+    j = get_job(job_id)
+    assert j[ur.STATE_KEY]["attempt"] == 1
+    nxt = datetime.fromisoformat(j["next_run_at"])
+    assert timedelta(0) < nxt - now <= timedelta(seconds=ur.RETRY_DELAYS_SECONDS[0] + 120)
+    assert ur.will_retry(j), "the interim failure notice stays suppressed while rungs remain"

@@ -2046,7 +2046,8 @@ def _run_agent_with_watchdog(
 def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgent) -> str:
     """Deliverable final response from a ``run_conversation`` result. Raises RuntimeError on
     `failed=True`/`completed=False`: the error text may sit in `final_response` and would otherwise
-    be delivered as the reply with the job marked ok."""
+    be delivered as the reply with the job marked ok. The raised RuntimeError carries the agent's
+    `.failure_reason` / `.api_calls`."""
     # If the agent itself reported failure (e.g. all retries exhausted on API errors, model abort, mid-run
     # interrupt), do not silently mark the job as successful. run_agent populates
     # `failed=True`/`completed=False` on these paths and may put the error into `final_response`, which
@@ -2056,7 +2057,14 @@ def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgen
     final_response_text = (result.get("final_response") or "").strip()
     max_iteration_summary = is_max_iteration_handoff(result)
     if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
-        raise RuntimeError(result.get("error") or final_response_text or "agent reported failure")
+        error = RuntimeError(result.get("error") or final_response_text or "agent reported failure")
+        # The agent loop classified this death (agent/error_classifier.py FailoverReason) and
+        # collapsed the transport chain into a summary string. Stamp the verdict + call count
+        # so cron's ladder classification (cron/unreachable_retry) can tell a mid-run transport
+        # death from a task failure; the raw chain is gone by then.
+        error.failure_reason = str(result.get("failure_reason") or "")
+        error.api_calls = int(result.get("api_calls") or 0)
+        raise error
     if max_iteration_summary:
         logger.warning(
             "Job '%s' reached the iteration limit but produced a final fallback response; "
@@ -2609,11 +2617,13 @@ def run_job(
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
         # Cowork-style unreachable-model re-run (cron/unreachable_retry.py): flag failures where
-        # the model was never reached (transient network/DNS, zero API calls) so the bookkeeping
+        # the model was never reached (transient network/DNS, zero API calls) or died on transport
+        # after the model went quiet mid-run (patch 0020:
+        # cron/unreachable_retry.is_midrun_transport_death_failure) so the bookkeeping
         # tail can schedule a bounded automatic re-run instead of waiting a full period.
         try:
-            from cron.unreachable_retry import is_model_unreachable_failure
-            if is_model_unreachable_failure(e, agent):
+            from cron.unreachable_retry import is_midrun_transport_death_failure, is_model_unreachable_failure
+            if is_model_unreachable_failure(e, agent) or is_midrun_transport_death_failure(e, agent):
                 job["_model_unreachable"] = True
             # Provider usage window closed for a known duration (cron/quota_hold.py): flag it so the
             # bookkeeping tail parks the job past the window instead of re-firing into it (#89376).

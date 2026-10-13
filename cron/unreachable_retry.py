@@ -12,6 +12,11 @@ which has to answer for one-shot dispatch accounting and mid-run side effects. R
 jobs only: finite one-shots are pre-claimed by ``claim_dispatch`` (at-most-times, #38758)
 and must not regain a consumed dispatch here.
 
+The estate patch (0020) also routes mid-run transport deaths into the same ladder: a run
+that reached the model but exhausted the agent loop's retries with a ``failure_reason`` of
+timeout/overloaded/server_error produced no deliverable either. See
+``is_midrun_transport_death_failure`` for the deliberate trade-off.
+
 While a retry is pending the failure notice is suppressed (Cowork re-runs silently); a
 run that reaches the model — success or not — resets the ladder. Disable with
 ``cron.retry_unreachable: false`` in config.yaml.
@@ -63,6 +68,28 @@ def is_model_unreachable_failure(exc: BaseException, agent: Any = None) -> bool:
     from cron.scheduler_preflight import _is_transient_provider_resolve_error
 
     return _is_transient_provider_resolve_error(exc)
+
+
+# Verdicts the agent loop assigns to transport-class transient API deaths
+# (agent/error_classifier.py FailoverReason). Mirrors
+# agent/turn_recovery_autorecover.py:_LADDER_REASONS — the same class of error the in-turn
+# ladder gives 5 escalating waits for; when THAT exhausts mid-run, the cron runner gets one
+# bounded re-run ladder too (kanban t_5bd6f136, estate patch 0020).
+_TRANSPORT_DEATH_REASONS = frozenset({"timeout", "overloaded", "server_error"})
+
+
+def is_midrun_transport_death_failure(exc: BaseException, agent: Any = None) -> bool:
+    """True when the run reached the model but DIED on transient transport afterwards:
+    the agent loop's own retries + auto-recovery exhausted with a transport-class verdict
+    (timeout/overloaded/server_error). Such a run produced no deliverable, so it joins the
+    unreachable-model re-run ladder via the same ``_model_unreachable`` flag — deliberately
+    extending the zero-API-call invariant: a partial side effect is preferred over losing a
+    whole period (Denis's call, kanban t_5bd6f136)."""
+    if str(getattr(exc, "failure_reason", "") or "") not in _TRANSPORT_DEATH_REASONS:
+        return False
+    # Belt: only when the loop stamped a call count and calls WERE made — the zero-call case
+    # belongs to is_model_unreachable_failure above (its stricter spend-neutral contract).
+    return int(getattr(exc, "api_calls", 0) or 0) > 0
 
 
 def _ladder_applies(job: Dict[str, Any]) -> bool:
