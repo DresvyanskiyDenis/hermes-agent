@@ -470,6 +470,29 @@ under the same `cron.retry_unreachable` switch. Unlike the zero-call case this r
 whatever the failed attempt already did, so a job with non-idempotent side effects should keep
 the ladder off (`cron.retry_unreachable: false`) or be re-entrant.
 
+### Machine-readable failure signal for watchdogs
+
+Every open failure is also one JSON file, `<profile home>/cron/failures/<job_id>.json`, written
+by the cron runner itself so an external watchdog can notice a dead job by reading files — there
+is no API. Existence of the file means the job has an open failure; one file per job, and the
+latest failure overwrites it. The next green run deletes it. While an automatic re-run (above) is
+still pending, no file is written: the interim rung stays silent, and the file appears once the
+ladder is exhausted or the failure never qualified for it. A delivery failure keeps the file
+open (`kind: delivery_failed`) even though the agent itself succeeded.
+
+| Field | Meaning |
+|---|---|
+| `schema` | Always `cron-failure-signal/1` |
+| `job_id`, `job_name` | The job |
+| `profile` | Profile owning the store (`default` for the root home) |
+| `at` | ISO timestamp of the failed run |
+| `kind` | The run's `last_status`: `error`, `delivery_failed`, `blocked_config`, ... |
+| `error` | Secret-redacted, length-capped error text (same normalization as the incident table) |
+| `error_sig` | Incident error signature for correlation with `hermes cron incidents`, or `null` |
+| `failure_streak` | Consecutive agent failures |
+| `next_run_at` | When the job fires next |
+| `retry_ladder` | `null`, or `{"attempt": N, "delays_seconds": [...]}` when the re-run ladder was exhausted |
+
 ### Holding a job through a closed provider usage window
 
 The mirror case: the provider says exactly how long it will stay closed. When
