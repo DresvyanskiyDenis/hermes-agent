@@ -12,6 +12,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_schedule as kbs
 
 PAST = "2000-01-01T00:00:00Z"
 FUTURE = "2999-01-01T00:00:00+00:00"
@@ -83,6 +84,23 @@ def test_future_deadline_stays_parked(kanban_home):
         kb.recompute_ready(conn)
         assert kb.get_task(conn, t).status == "scheduled"
         assert kb.claim_task(conn, t) is None
+
+
+def test_wake_fires_at_deadline_not_before(kanban_home):
+    stamp = "2030-06-01T12:00:00+00:00"
+    deadline = int(datetime.datetime.fromisoformat(stamp).timestamp())
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="wait", assignee="ops")
+        assert kb.schedule_task(conn, t, until=stamp)
+        with kb.write_txn(conn):
+            assert kbs.wake_due_scheduled(conn, deadline - 1) == 0
+        assert kb.get_task(conn, t).status == "scheduled"
+        assert not _woken_events(conn, t)
+        with kb.write_txn(conn):
+            assert kbs.wake_due_scheduled(conn, deadline) == 1
+        task = kb.get_task(conn, t)
+        assert (task.status, task.scheduled_until) == ("ready", None)
+        assert _woken_events(conn, t)
 
 
 def test_markerless_park_is_not_woken(kanban_home):
