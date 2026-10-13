@@ -14,37 +14,31 @@ import sqlite3
 from typing import Any, Optional
 
 # Mirrors the keeper watchdog's UNTIL_RE so legacy reason markers keep parsing.
-SCHEDULED_UNTIL_RE = re.compile(r"SCHEDULED_UNTIL=([0-9T:+.\-Z]+)")
+_SCHEDULED_UNTIL_RE = re.compile(r"SCHEDULED_UNTIL=([0-9T:+.\-Z]+)")
 
 
 def parse_until_iso(text: str) -> Optional[int]:
     """ISO8601 instant -> epoch seconds; a naive stamp is machine-local.
     ``None`` on any parse failure (callers decide whether that is an error)."""
     try:
-        dt = datetime.datetime.fromisoformat(text.strip())
-    except (ValueError, TypeError, AttributeError):
+        return int(datetime.datetime.fromisoformat(text).timestamp())
+    except ValueError:
         return None
-    if dt.tzinfo is None:
-        dt = dt.astimezone()
-    return int(dt.timestamp())
-
-
-def parse_scheduled_until(reason: Optional[str]) -> Optional[int]:
-    """Deadline from a ``SCHEDULED_UNTIL=<ISO8601>`` marker in free text;
-    ``None`` when absent or garbage (legacy tolerance: degrade to no timer)."""
-    match = SCHEDULED_UNTIL_RE.search(reason or "")
-    return parse_until_iso(match.group(1)) if match else None
 
 
 def resolve_deadline(reason: Optional[str], until: Optional[str]) -> Optional[int]:
-    """Park deadline: explicit ``until`` beats the reason marker. A non-blank
-    ``until`` that does not parse raises ``ValueError`` (caller error)."""
-    if until and until.strip():
+    """Park deadline: explicit ``until`` beats a ``SCHEDULED_UNTIL=<ISO8601>``
+    marker in ``reason``. A non-blank ``until`` that does not parse raises
+    ``ValueError`` (caller error); a garbage marker degrades to no timer."""
+    until = (until or "").strip()
+    if until:
         deadline = parse_until_iso(until)
         if deadline is None:
-            raise ValueError("unparseable until: expected ISO8601")
+            raise ValueError(
+                f"unparseable until {until!r}: expected ISO8601, e.g. 2026-10-14T09:30:00+03:00")
         return deadline
-    return parse_scheduled_until(reason)
+    match = _SCHEDULED_UNTIL_RE.search(reason or "")
+    return parse_until_iso(match.group(1)) if match else None
 
 
 def wake_due_scheduled(conn: sqlite3.Connection, now: int) -> int:
@@ -54,25 +48,20 @@ def wake_due_scheduled(conn: sqlite3.Connection, now: int) -> int:
 
     rows = conn.execute(
         "SELECT id, scheduled_until FROM tasks WHERE status = 'scheduled' "
-        "AND scheduled_until IS NOT NULL AND scheduled_until <= ?", (now,),
+        "AND scheduled_until <= ?", (now,),
     ).fetchall()
-    woken = 0
     for row in rows:
         task_id = row["id"]
         landing = _kb._landing_status_after_parents(conn, task_id)
-        cur = conn.execute(
+        conn.execute(
             "UPDATE tasks SET status = ?, scheduled_until = NULL, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status = 'scheduled'", (landing, task_id),
+            "consecutive_failures = 0, last_failure_error = NULL WHERE id = ?", (landing, task_id),
         )
-        if cur.rowcount != 1:
-            continue
         _kb._append_event(conn, task_id, "unblocked", {
             "reason": "scheduled deadline elapsed", "status": landing,
-            "deadline": int(row["scheduled_until"]),
+            "deadline": row["scheduled_until"],
         })
-        woken += 1
-    return woken
+    return len(rows)
 
 
 def schedule_task(
