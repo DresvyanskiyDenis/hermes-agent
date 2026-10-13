@@ -463,14 +463,18 @@ def test_schedule_until_persists_deadline(worker_env):
     from hermes_cli import kanban_db_connect as kbc
     from tools import kanban_tools as kt
 
-    stamp = "2999-01-01T00:00:00Z"
+    stamp = "2000-01-01T00:00:00Z"
     out = json.loads(kt._handle_schedule({"reason": "vendor", "until": stamp}))
 
     assert out["ok"] is True
     with kbc.connect() as conn:
         task = kb.get_task(conn, worker_env)
-    expected = int(datetime.datetime.fromisoformat(stamp).timestamp())
-    assert (task.status, task.scheduled_until) == ("scheduled", expected)
+        expected = int(datetime.datetime.fromisoformat(stamp).timestamp())
+        assert (task.status, task.scheduled_until) == ("scheduled", expected)
+        # The persisted deadline is live: one recompute pass wakes the park.
+        kb.recompute_ready(conn)
+        task = kb.get_task(conn, worker_env)
+        assert (task.status, task.scheduled_until) == ("ready", None)
 
 
 def test_schedule_rejects_unparseable_until(worker_env):
