@@ -193,12 +193,6 @@ def test_ladder_reruns_do_not_spend_extra_repeat_budget(tmp_cron_home, monkeypat
     assert not ur.will_retry(dict(runs[1], repeat={"times": 1, "completed": 1}))
 
 
-class _AIAgentStub:
-    @staticmethod
-    def _format_turn_completion_explanation(*_a, **_kw):
-        return ""
-
-
 def _transport_death(failure_reason: str, api_calls: int) -> RuntimeError:
     exc = RuntimeError("Hermes can't reach the model provider")
     exc.failure_reason = failure_reason
@@ -213,7 +207,8 @@ def test_final_response_from_result_stamps_transport_verdict():
               "failure_reason": "timeout", "api_calls": 4, "final_response": "",
               "turn_exit_reason": ""}
     with pytest.raises(RuntimeError) as info:
-        sched._final_response_from_result(result, "j1", "j", _AIAgentStub)
+        # The failed path raises before touching AIAgent.
+        sched._final_response_from_result(result, "j1", "j", object)
     assert info.value.failure_reason == "timeout"
     assert info.value.api_calls == 4
 
@@ -224,6 +219,14 @@ def test_midrun_transport_death_classifies_but_task_failure_does_not():
     # Zero calls belongs to is_model_unreachable_failure's stricter spend-neutral gate.
     assert not ur.is_midrun_transport_death_failure(_transport_death("timeout", 0))
     assert not ur.is_midrun_transport_death_failure(_transport_death("content_policy_blocked", 9))
+
+
+def test_transport_death_reasons_track_the_in_turn_ladder():
+    """Cron re-runs exactly what the in-turn auto-recovery ladder retries; a reason added there
+    must be a deliberate decision here too."""
+    from agent.turn_recovery_autorecover import _LADDER_REASONS
+
+    assert ur._TRANSPORT_DEATH_REASONS == {r.value for r in _LADDER_REASONS}
 
 
 def test_midrun_transport_death_shares_the_ladder(tmp_cron_home):
