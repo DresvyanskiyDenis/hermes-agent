@@ -5,6 +5,7 @@ parks without any external unblock."""
 from __future__ import annotations
 
 import datetime
+import time
 from pathlib import Path
 
 import pytest
@@ -145,4 +146,34 @@ def test_dispatcher_tick_wakes_due_park(kanban_home):
         assert res.promoted >= 1
         task = kb.get_task(conn, t)
         assert (task.status, task.scheduled_until) == ("ready", None)
+        assert _woken_events(conn, t)
+
+
+def test_wake_reclaims_dangling_open_run(kanban_home):
+    """Invariant ``current_run_id IS NULL <=> run row terminal``: a leaked open
+    run under a due park is reclaimed before the wake UPDATE NULLs the pointer
+    (mirrors ``unblock_task``; red without the ``_reclaim_dangling_run`` guard)."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="wait", assignee="ops")
+        run = kb.claim_task(conn, t)
+        assert run is not None
+        run_id = run.current_run_id
+        assert kb.schedule_task(conn, t, until=PAST)
+        # Forge the leak: park normally closes the run; put it back open and
+        # re-point the task at it, as a crash between flip and closure would.
+        conn.execute(
+            "UPDATE task_runs SET status = 'running', outcome = NULL, ended_at = NULL "
+            "WHERE id = ?", (run_id,),
+        )
+        conn.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (run_id, t))
+        with kb.write_txn(conn):
+            assert kbs.wake_due_scheduled(conn, int(time.time())) == 1
+        row = conn.execute(
+            "SELECT status, outcome, ended_at FROM task_runs WHERE id = ?", (run_id,),
+        ).fetchone()
+        assert row["status"] == "reclaimed"
+        assert row["outcome"] == "reclaimed"
+        assert row["ended_at"] is not None
+        task = kb.get_task(conn, t)
+        assert (task.status, task.current_run_id, task.scheduled_until) == ("ready", None, None)
         assert _woken_events(conn, t)
