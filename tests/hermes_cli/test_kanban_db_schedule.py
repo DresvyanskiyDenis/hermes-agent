@@ -76,16 +76,6 @@ def test_garbage_reason_marker_parks_without_timer(kanban_home):
         assert (task.status, task.scheduled_until) == ("scheduled", None)
 
 
-def test_due_deadline_wakes_to_ready(kanban_home):
-    with kbc.connect() as conn:
-        t = kb.create_task(conn, title="wait", assignee="ops")
-        assert kb.schedule_task(conn, t, until=PAST)
-        assert kb.recompute_ready(conn) >= 1
-        task = kb.get_task(conn, t)
-        assert (task.status, task.scheduled_until) == ("ready", None)
-        assert _woken_events(conn, t)
-
-
 def test_future_deadline_stays_parked(kanban_home):
     with kbc.connect() as conn:
         t = kb.create_task(conn, title="wait", assignee="ops")
@@ -135,5 +125,6 @@ def test_dispatcher_tick_wakes_due_park(kanban_home):
         assert kb.schedule_task(conn, t, until=PAST)
         res = kbd.dispatch_once(conn, dry_run=True)
         assert res.promoted >= 1
-        assert kb.get_task(conn, t).status == "ready"
+        task = kb.get_task(conn, t)
+        assert (task.status, task.scheduled_until) == ("ready", None)
         assert _woken_events(conn, t)

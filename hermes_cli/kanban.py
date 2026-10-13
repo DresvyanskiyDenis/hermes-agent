@@ -1010,12 +1010,12 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
     from hermes_cli.kanban_db_schedule import resolve_deadline
 
     reason = _joined_words(args.reason)
-    until = _stripped_or_none(getattr(args, "until", None))
+    until = getattr(args, "until", None)
     try:
         # Validate before any write so a bad --until never half-applies a bulk park.
         resolve_deadline(reason, until)
     except ValueError as e:
-        return _err(f"kanban schedule: {e} (got {until!r}), e.g. 2026-10-14T09:30+03:00")
+        return _err(f"kanban schedule: {e}")
     author = _profile_author()
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""

@@ -219,11 +219,8 @@ KANBAN_SCHEDULE_SCHEMA = _schema(
             "the completed run and scheduled event."
         )),
         "until": _prop("string", (
-            "Optional ISO8601 wake deadline, e.g. 2026-10-14T09:30:00+03:00. "
-            "When set, the kernel dispatcher promotes the task automatically "
-            "once the deadline passes — no external unblock needed. A naive "
-            "stamp is machine-local. Alternatively put SCHEDULED_UNTIL=<ISO8601> "
-            "in reason."
+            "Optional ISO8601 wake deadline, e.g. 2026-10-14T09:30:00+03:00; "
+            "a naive stamp is machine-local."
         )),
     },
     [],
