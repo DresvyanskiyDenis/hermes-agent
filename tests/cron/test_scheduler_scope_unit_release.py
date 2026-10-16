@@ -8,7 +8,6 @@ completed. The gateway's waiter releases it, by the exact unit name only.
 from __future__ import annotations
 
 import subprocess
-import threading
 from unittest.mock import Mock
 
 from cron import scheduler_detached_worker as detached
@@ -29,24 +28,11 @@ class _FakeProcess:
         self.killed = True
 
 
-def _run_release(monkeypatch, process, unit, *, active: bool, **kwargs):
+def _run_release(monkeypatch, process, unit, *, active: bool, grace: float = 0.05):
     stops: list = []
     monkeypatch.setattr(detached, "_scope_unit_is_active", lambda name: active)
     monkeypatch.setattr("tools.process_registry._stop_systemd_unit", lambda *a: stops.append(a) or True)
-    started: list[threading.Thread] = []
-
-    class _RecordingThread(threading.Thread):
-        def start(self):
-            started.append(self)
-            super().start()
-
-    monkeypatch.setattr(detached.threading, "Thread", _RecordingThread)
-    detached.schedule_scope_unit_release(process, unit, grace_seconds=kwargs.get("grace", 0.05),
-                                         poll_seconds=0.01, deadline_seconds=0.01)
-    [thread] = started
-    assert thread.name == f"cron-scope-release-{process.pid}"
-    thread.join(timeout=5)
-    assert not thread.is_alive()
+    detached._release_scope_unit(process, unit, grace_seconds=grace, poll_seconds=0.01, deadline_seconds=0.01)
     return stops
 
 
@@ -111,7 +97,14 @@ def test_body_schedules_release_after_worker_exit_with_terminal_row(monkeypatch)
 def test_scope_unit_name_matches_dispatch_argv(monkeypatch):
     import tools.process_registry as pr
 
+    monkeypatch.setattr(pr, "_IS_LINUX", True)
+    monkeypatch.setenv("INVOCATION_ID", "test")
+    monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: True)
+    monkeypatch.setattr(pr, "_systemd_run_user_scope_available", lambda: True)
     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
-    argv = pr._build_systemd_scope_argv(["true"], unit_suffix="cron-j1-exec-e1")
+    dispatch = pr.restart_safe_gateway_child_argv(
+        ["true"], unit_suffix="cron-j1-exec-e1", require_restart_safe_scope=True)
     # systemd appends ``.scope`` to a ``--scope`` unit name given without a suffix.
-    assert f"{argv[argv.index('--unit') + 1]}.scope" == detached.build_cron_worker_unit_name("j1", "e1")
+    assert dispatch.mode == "scoped"
+    assert dispatch.unit == f"{dispatch.argv[dispatch.argv.index('--unit') + 1]}.scope"
+    assert dispatch.unit == "hermes-worker-cron-j1-exec-e1.scope"

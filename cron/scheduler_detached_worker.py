@@ -82,16 +82,6 @@ def reap_terminal_worker_in_background(process: subprocess.Popen) -> None:
     ).start()
 
 
-def build_cron_worker_unit_name(job_id: str, execution_id: str) -> str:
-    """The transient scope unit ``_launch_external_cron_worker`` dispatches the worker into.
-
-    Must match ``tools.process_registry._build_systemd_scope_argv(command,
-    unit_suffix=f"cron-{job_id}-exec-{execution_id}")``: an exact name is the only thing
-    the release below may ever stop.
-    """
-    return f"hermes-worker-cron-{job_id}-exec-{execution_id}.scope"
-
-
 def _scope_unit_is_active(unit_name: str) -> bool:
     """True only when ``systemctl --user is-active`` reports active/activating.
 
@@ -145,40 +135,46 @@ def schedule_scope_unit_release(
     stopped by the EXACT unit name. Operator lesson: never glob ``hermes-worker-*``,
     which would also stop live workers and background jobs in their own units.
     """
-    def _release() -> None:
-        try:
-            try:
-                process.wait(timeout=deadline_seconds)
-            except subprocess.TimeoutExpired:
-                logger.warning(
-                    "Cron worker pid %s still running %s s after its ledger row went terminal; "
-                    "killing it to release scope unit %s",
-                    process.pid, deadline_seconds, scope_unit,
-                )
-                with contextlib.suppress(Exception):
-                    process.kill()
-                with contextlib.suppress(Exception):
-                    process.wait(timeout=30)
-            grace_ends = time.monotonic() + grace_seconds
-            while time.monotonic() < grace_ends:
-                if not _scope_unit_is_active(scope_unit):
-                    return
-                time.sleep(poll_seconds)
-            from tools.process_registry import _stop_systemd_unit
-
-            if _stop_systemd_unit(scope_unit):
-                logger.info(
-                    "Released restart-safe cron worker scope unit %s (worker reaped, ledger terminal)",
-                    scope_unit,
-                )
-            else:
-                logger.warning("Could not release restart-safe cron worker scope unit %s", scope_unit)
-        except Exception as exc:
-            # Best-effort reclamation: must never surface to the gateway tick.
-            logger.debug("Releasing cron worker scope unit %s failed: %s", scope_unit, exc, exc_info=True)
-
     threading.Thread(
-        target=_release,
+        target=_release_scope_unit,
+        args=(process, scope_unit, grace_seconds, poll_seconds, deadline_seconds),
         name=f"cron-scope-release-{getattr(process, 'pid', '?')}",
         daemon=True,
     ).start()
+
+
+def _release_scope_unit(
+    process: subprocess.Popen, scope_unit: str, grace_seconds: float, poll_seconds: float,
+    deadline_seconds: float,
+) -> None:
+    """Thread body of :func:`schedule_scope_unit_release`."""
+    try:
+        try:
+            process.wait(timeout=deadline_seconds)
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "Cron worker pid %s still running %s s after its ledger row went terminal; "
+                "killing it to release scope unit %s",
+                process.pid, deadline_seconds, scope_unit,
+            )
+            with contextlib.suppress(Exception):
+                process.kill()
+            with contextlib.suppress(Exception):
+                process.wait(timeout=30)
+        grace_ends = time.monotonic() + grace_seconds
+        while time.monotonic() < grace_ends:
+            if not _scope_unit_is_active(scope_unit):
+                return
+            time.sleep(poll_seconds)
+        from tools.process_registry import _stop_systemd_unit
+
+        if _stop_systemd_unit(scope_unit):
+            logger.info(
+                "Released restart-safe cron worker scope unit %s (worker reaped, ledger terminal)",
+                scope_unit,
+            )
+        else:
+            logger.warning("Could not release restart-safe cron worker scope unit %s", scope_unit)
+    except Exception as exc:
+        # Best-effort reclamation: must never surface to the gateway tick.
+        logger.debug("Releasing cron worker scope unit %s failed: %s", scope_unit, exc, exc_info=True)

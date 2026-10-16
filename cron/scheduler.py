@@ -3646,7 +3646,6 @@ def _launch_external_cron_worker(job: dict) -> bool:
     ]
 
     from agent.secret_scope import is_multiplex_active
-    from cron.scheduler_detached_worker import build_cron_worker_unit_name
     from cron.scheduler_provider import routed_profile_fire
     from tools.environments.local import build_subprocess_env, strip_launch_profile_env
     from tools.process_registry import (
@@ -3673,7 +3672,6 @@ def _launch_external_cron_worker(job: dict) -> bool:
     )
     if dispatch.mode == "in_process":
         return False
-    scope_unit = build_cron_worker_unit_name(job_id, execution_id) if dispatch.mode == "scoped" else None
 
     if mark_execution_handoff_pending(execution_id) is None:
         raise RuntimeError(
@@ -3776,7 +3774,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
                     job_id=job_id,
                     handoff_files=(payload_path, stderr_path),
                     stderr_path=stderr_path,
-                    scope_unit=scope_unit,
+                    scope_unit=dispatch.unit,
                 )
             finally:
                 ack_path.unlink(missing_ok=True)
@@ -3795,7 +3793,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
                     job_id=job_id,
                     handoff_files=(payload_path, stderr_path),
                     stderr_path=stderr_path,
-                    scope_unit=scope_unit,
+                    scope_unit=dispatch.unit,
                 )
             logger.info(
                 "Cron job '%s' handed to restart-safe worker pid=%s execution=%s dispatch=%s",
@@ -3815,7 +3813,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
                 job_id=job_id,
                 handoff_files=(payload_path, stderr_path),
                 stderr_path=stderr_path,
-                scope_unit=scope_unit,
+                scope_unit=dispatch.unit,
             )
         returncode = process.poll()
         if returncode is not None:
@@ -3856,7 +3854,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
         job_id=job_id,
         handoff_files=(payload_path, ack_path, stderr_path),
         stderr_path=stderr_path,
-        scope_unit=scope_unit,
+        scope_unit=dispatch.unit,
     )
 
 
