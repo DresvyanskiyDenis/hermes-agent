@@ -505,17 +505,6 @@ def _stop_systemd_unit(unit_name: str) -> bool:
         return False
 
 
-def format_uptime_short(seconds: int) -> str:
-    s = max(0, int(seconds))
-    if s < 60:
-        return f"{s}s"
-    mins, secs = divmod(s, 60)
-    if mins < 60:
-        return f"{mins}m {secs}s"
-    hours, mins = divmod(mins, 60)
-    return f"{hours}h {mins}m"
-
-
 def _not_found(session_id: str) -> dict:
     return {"status": "not_found", "error": f"No process with ID {session_id}"}
 
