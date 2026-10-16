@@ -22,8 +22,10 @@ logger = logging.getLogger(__name__)
 
 SCOPE_RELEASE_GRACE_SECONDS = 60.0  # let cleanly-exiting stragglers drain first
 SCOPE_RELEASE_POLL_SECONDS = 5.0
-# Ledger acceptance bound: a terminalized execution's unit must never stay loaded-active
-# more than 30 min.
+# BEST-EFFORT bound on how long a terminalized execution's unit stays loaded-active: the
+# release thread is a daemon and dies with a gateway restart while its worker still drains
+# (the restart-safe case: no waiter survives). Such residual units are handled operationally
+# by ledger-checked exact-name cleanup (safe_worker_cleanup) and the zombie-scope sentinel.
 SCOPE_RELEASE_DEADLINE_SECONDS = 1800.0
 
 
@@ -102,9 +104,9 @@ def _scope_unit_is_active(unit_name: str) -> bool:
             env=systemd_user_bus_env(), check=False,
         )
     except Exception as exc:
-        logger.debug("systemctl --user is-active %s failed: %s", unit_name, exc, exc_info=True)
+        logger.warning("systemctl --user is-active %s failed: %s", unit_name, exc, exc_info=True)
         return False
-    return (result.stdout or b"").decode(errors="replace").strip().startswith("active")
+    return (result.stdout or b"").decode(errors="replace").strip() in ("active", "activating")
 
 
 def schedule_scope_unit_release(

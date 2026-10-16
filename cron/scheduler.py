@@ -3509,7 +3509,8 @@ def _wait_for_external_cron_worker_body(
     worker or change its ledger ownership.
 
     *scope_unit* names the worker's transient scope when it was dispatched into one: every
-    normal return (row confirmed terminal) schedules its release, never the raise path.
+    path that finds the ledger row terminal schedules its release — normal returns and the
+    raise alike (the raise only routes post-handoff bookkeeping); a still-open row never releases.
     """
     def _is_terminal() -> bool:
         current = get_execution(execution_id)
@@ -3545,7 +3546,12 @@ def _wait_for_external_cron_worker_body(
                 return _terminal()
         # The worker can commit its terminal row and exit between the first
         # read and wait(). Re-read the exact attempt before declaring that
-        # it died without terminalizing.
+        # it died without terminalizing. The gate stays completed/failed on
+        # purpose: an ``unknown`` row must fall through to the dead-owner
+        # section so this waiter's exit code and stderr still surface as
+        # evidence — the release there is what keeps the raise from leaking
+        # the scope unit (tests/cron/test_restart_safe_worker_death_evidence
+        # pins the evidence; the raise-path release pins the leak closed).
         current = get_execution(execution_id)
         if current and current.get("status") in ("completed", "failed"):
             return _terminal()
@@ -3578,6 +3584,15 @@ def _wait_for_external_cron_worker_body(
             current = get_execution(execution_id)
             if current and current.get("status") in ("completed", "failed"):
                 return _terminal()
+            # Release before the raise on ANY terminal row — the incident state is
+            # ``unknown``: a worker that recorded it itself (give_up_execution) exits
+            # cleanly, terminalize_dead_owner refuses an already-terminal row, and
+            # without this the raise strands the cgroup stragglers pinning the unit.
+            # The check reuses the read above: no second ledger round-trip, so the
+            # release stays pinned to the exact row this waiter just observed. A
+            # still-open row must NEVER release — another owner may still hold it.
+            if current and current.get("status") in _TERMINAL_STATES:
+                _terminal()
         stderr_tail = ""
         if stderr_path is not None:
             from cron.scheduler_diagnostics import external_worker_stderr_tail

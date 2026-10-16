@@ -42,7 +42,6 @@ def test_release_stops_exact_unit_when_active_after_worker_exit(monkeypatch):
     unit = "hermes-worker-cron-j1-exec-e1.scope"
     stops = _run_release(monkeypatch, _FakeProcess(4101), unit, active=True)
     assert stops == [(unit,)]
-    assert not any(ch in stops[0][0] for ch in "*?[")
 
 
 def test_release_skips_when_unit_already_inactive(monkeypatch):
@@ -137,3 +136,64 @@ def test_body_releases_scope_on_dead_owner_terminalization(monkeypatch):
     with pytest.raises(RuntimeError):
         scheduler._wait_for_external_cron_worker_body(process, execution_id="e1", scope_unit=None)
     release.assert_not_called()
+
+
+def _dead_worker_body(monkeypatch, status: str):
+    from cron import scheduler
+
+    monkeypatch.setattr(scheduler, "get_execution",
+                        lambda _eid: {"id": "e1", "status": status}, raising=False)
+    monkeypatch.setattr(scheduler, "terminalize_dead_owner",
+                        lambda _eid, reason=None: False, raising=False)
+    monkeypatch.setattr(scheduler, "recover_interrupted_executions", lambda: None, raising=False)
+    release = Mock()
+    monkeypatch.setattr(detached, "schedule_scope_unit_release", release)
+    process = Mock()
+    process.wait.return_value = -9
+    return scheduler, process, release
+
+
+def test_body_releases_scope_before_raise_on_unknown_terminal_row(monkeypatch):
+    """A worker that recorded ``unknown`` itself exits cleanly; the narrow re-read gates
+    still raise (death evidence), but the raise must not leak the scope unit."""
+    scheduler, process, release = _dead_worker_body(monkeypatch, "unknown")
+
+    unit = "hermes-worker-cron-j1-exec-e1.scope"
+    with pytest.raises(RuntimeError):
+        scheduler._wait_for_external_cron_worker_body(process, execution_id="e1", scope_unit=unit)
+    release.assert_called_once_with(process, unit)
+
+    release.reset_mock()
+    with pytest.raises(RuntimeError):
+        scheduler._wait_for_external_cron_worker_body(process, execution_id="e1", scope_unit=None)
+    release.assert_not_called()
+
+
+def test_body_never_releases_while_row_open(monkeypatch):
+    scheduler, process, release = _dead_worker_body(monkeypatch, "running")
+
+    with pytest.raises(RuntimeError):
+        scheduler._wait_for_external_cron_worker_body(
+            process, execution_id="e1", scope_unit="hermes-worker-cron-j1-exec-e1.scope")
+    release.assert_not_called()
+
+
+@pytest.mark.parametrize(("state", "expected"), [
+    ("active", True), ("activating", True), ("inactive", False),
+])
+def test_scope_unit_is_active_reads_systemctl_state(monkeypatch, state, expected):
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(detached.subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout=f"{state}\n".encode()))
+    assert detached._scope_unit_is_active("hermes-worker-cron-j1-exec-e1.scope") is expected
+
+
+def test_scope_unit_is_active_fails_open_loudly_when_systemctl_unreachable(monkeypatch, caplog):
+    def _boom(*_a, **_k):
+        raise OSError("no user bus")
+
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(detached.subprocess, "run", _boom)
+    with caplog.at_level("WARNING", logger=detached.logger.name):
+        assert detached._scope_unit_is_active("hermes-worker-cron-j1-exec-e1.scope") is False
+    assert any(r.levelname == "WARNING" for r in caplog.records)
