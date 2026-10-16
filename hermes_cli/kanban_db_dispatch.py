@@ -51,6 +51,11 @@ KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS = 30
 # (two default dispatch ticks).
 TERMINAL_WORKER_REAP_GRACE_SECONDS = 120
 
+# The reaper releases a terminal run's systemd scope only within this window
+# after task_runs.ended_at; older residual scopes are left to operator-side,
+# ledger-checked exact-name cleanup.
+TERMINAL_WORKER_SCOPE_RELEASE_WINDOW_SECONDS = 1800
+
 # ---------------------------------------------------------------------------
 # Respawn guard constants
 # ---------------------------------------------------------------------------
@@ -514,7 +519,7 @@ def reap_terminal_workers(conn: sqlite3.Connection, *, signal_fn=None) -> list[s
     One row's failure (signal, /proc probe) is logged and skips only that row.
     Returns the task ids whose worker was terminated."""
     rows = conn.execute(
-        "SELECT id, task_id, worker_pid, worker_started_at, claim_lock FROM task_runs "
+        "SELECT id, task_id, worker_pid, worker_started_at, claim_lock, ended_at FROM task_runs "
         "WHERE ended_at IS NOT NULL AND ended_at <= ? "
         "AND worker_pid IS NOT NULL AND worker_started_at IS NOT NULL",
         (int(time.time()) - TERMINAL_WORKER_REAP_GRACE_SECONDS,),
@@ -545,6 +550,11 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
             pid, row["claim_lock"], signal_fn=signal_fn, started_at=fingerprint)
         if not termination["terminated"]:
             return  # still alive: try again next tick
+    # The client is provably gone from here on: release its scope before the evidence goes.
+    scope = _release_terminal_worker_scope(
+        conn, row["task_id"], row["id"], now=int(time.time()), ended_at=int(row["ended_at"]))
+    if "skipped" in scope:
+        _kb._log.debug("kanban dispatch: worker scope release skipped for run %s: %s", row["id"], scope)
     with _kb.write_txn(conn):
         conn.execute(
             "UPDATE task_runs SET worker_pid = NULL, worker_started_at = NULL "
@@ -554,10 +564,83 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
         if alive:
             _kb._append_event(
                 conn, row["task_id"], "terminal_worker_reaped",
-                {"pid": pid, "worker_started_at": fingerprint, **termination}, run_id=row["id"],
+                {"pid": pid, "worker_started_at": fingerprint, **termination, "scope": scope},
+                run_id=row["id"],
             )
+        if "released" in scope:
+            _kb._append_event(
+                conn, row["task_id"], "worker_scope_released", {"pid": pid, **scope}, run_id=row["id"])
     if alive:
         reaped.append(row["task_id"])
+
+
+def _worker_scope_unit_name(task_id: str, run_id: int) -> str:
+    """The exact transient scope unit a kanban worker for this run was spawned in.
+
+    Exact names only — never glob ``hermes-worker-*``: an operator blanket stop
+    killed live workers (incident 2026-10-16). Must match the ``unit_suffix``
+    computed in ``_restart_safe_worker_argv`` plus the ``hermes-worker-<suffix>``
+    + ``.scope`` naming in ``tools.process_registry._systemd_scope_argv``. Upstream
+    PR #139844 introduces ``systemd_scope_unit_name()``; switch this call site to
+    it once that lands."""
+    return f"hermes-worker-kanban-{task_id}-run-{run_id}.scope"
+
+
+def _scope_unit_is_active(unit_name: str) -> bool:
+    """True only when ``systemctl --user is-active`` reports ``active`` or
+    ``activating``. No systemctl, any other state or any error is False: never
+    stop what we cannot see."""
+    import shutil
+
+    from tools.process_registry import systemd_user_bus_env
+
+    binary = shutil.which("systemctl")
+    if binary is None:
+        return False
+    try:
+        result = subprocess.run(
+            [binary, "--user", "is-active", unit_name],
+            capture_output=True,
+            timeout=10,
+            stdin=subprocess.DEVNULL,
+            env=systemd_user_bus_env(),
+            check=False,
+        )
+    except Exception:  # health: allow BLE001 -- never stop what we cannot see: any probe fault reads as not active
+        _kb._log.warning("kanban dispatch: systemctl is-active %s failed", unit_name, exc_info=True)
+        return False
+    return (result.stdout or b"").decode(errors="replace").strip() in ("active", "activating")
+
+
+def _release_terminal_worker_scope(conn, task_id: str, run_id: int, *, now: int, ended_at: int) -> dict:
+    """Stop the scope unit of a terminal run whose client is already gone (the
+    kanban mirror of the cron-side release path added in #139844; stop as #70716).
+
+    A ``--collect`` scope stays active while any straggler (a daemonised
+    grandchild, a client hung after ``kanban_complete``) keeps its cgroup
+    non-empty, so the reaper stops it by exact name. Best-effort and only within
+    ``TERMINAL_WORKER_SCOPE_RELEASE_WINDOW_SECONDS`` of ``ended_at``: older
+    residuals are left to operator-side, ledger-checked exact-name cleanup.
+    Returns an audit dict and never raises."""
+    try:
+        if now - ended_at > TERMINAL_WORKER_SCOPE_RELEASE_WINDOW_SECONDS:
+            return {"skipped": "outside_window"}
+        unit = _worker_scope_unit_name(task_id, run_id)
+        if not _scope_unit_is_active(unit):
+            return {"skipped": "not_active", "unit": unit}
+        from tools.process_registry import _stop_systemd_unit
+
+        if _stop_systemd_unit(unit):
+            _kb._log.info("kanban dispatch: released worker scope %s (task %s)", unit, task_id)
+            return {"released": True, "unit": unit}
+        _kb._log.warning("kanban dispatch: failed to release worker scope %s (task %s)", unit, task_id)
+        return {"released": False, "unit": unit}
+    except Exception:  # health: allow BLE001 -- best-effort release must never abort the reaper row
+        _kb._log.debug(
+            "kanban dispatch: worker scope release failed for run %s (task %s)",
+            run_id, task_id, exc_info=True,
+        )
+        return {"skipped": "error"}
 
 
 def _worker_survived_termination(termination: dict) -> bool:
