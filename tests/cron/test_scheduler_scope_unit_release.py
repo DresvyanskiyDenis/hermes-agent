@@ -10,6 +10,8 @@ from __future__ import annotations
 import subprocess
 from unittest.mock import Mock
 
+import pytest
+
 from cron import scheduler_detached_worker as detached
 
 
@@ -108,3 +110,30 @@ def test_scope_unit_name_matches_dispatch_argv(monkeypatch):
     assert dispatch.mode == "scoped"
     assert dispatch.unit == f"{dispatch.argv[dispatch.argv.index('--unit') + 1]}.scope"
     assert dispatch.unit == "hermes-worker-cron-j1-exec-e1.scope"
+
+
+def test_body_releases_scope_on_dead_owner_terminalization(monkeypatch):
+    """The crash path terminalizes the row and RAISES for bookkeeping (#128509) — the
+    release must still be scheduled there: the dead worker's cgroup stragglers are the
+    leak class, and this is where they most often come from."""
+    from cron import scheduler
+
+    monkeypatch.setattr(scheduler, "get_execution",
+                        lambda _eid: {"id": "e1", "status": "running"}, raising=False)
+    monkeypatch.setattr(scheduler, "terminalize_dead_owner",
+                        lambda _eid, reason=None: True, raising=False)
+    release = Mock()
+    monkeypatch.setattr(detached, "schedule_scope_unit_release", release)
+    process = Mock()
+    process.wait.return_value = -15  # worker died first with the row still open
+
+    unit = "hermes-worker-cron-j1-exec-e1.scope"
+    with pytest.raises(RuntimeError):
+        scheduler._wait_for_external_cron_worker_body(process, execution_id="e1", scope_unit=unit)
+    release.assert_called_once_with(process, unit)
+
+    # scope_unit=None keeps the pre-fix behavior on the raise path: no release, same raise.
+    release.reset_mock()
+    with pytest.raises(RuntimeError):
+        scheduler._wait_for_external_cron_worker_body(process, execution_id="e1", scope_unit=None)
+    release.assert_not_called()

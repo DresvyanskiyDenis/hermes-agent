@@ -3564,7 +3564,14 @@ def _wait_for_external_cron_worker_body(
         from cron.scheduler_worker_failure import external_worker_exited_reason
 
         reason = external_worker_exited_reason(returncode)
-        if not terminalize_dead_owner(execution_id, reason=reason):
+        if terminalize_dead_owner(execution_id, reason=reason):
+            # The row IS terminal now — the raise below only routes the post-handoff
+            # bookkeeping (#128509), it does not dispute the terminalization. Schedule
+            # the scope release like the success returns, or the dead worker's cgroup
+            # stragglers pin the transient unit open: the crash path is the leak class
+            # this closes, not just the graceful one.
+            _terminal()
+        else:
             recover_interrupted_executions()
             # A concurrent sweep may have won the unknown transition. Still
             # surface this waiter's exit code and stderr instead of discarding them.
