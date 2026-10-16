@@ -26,6 +26,14 @@ from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
 
+from hermes_cli.kanban_db_dispatch_worker_scope import (
+    TERMINAL_WORKER_SCOPE_RELEASE_WINDOW_SECONDS,
+    _release_terminal_worker_scope,
+    _restart_safe_worker_argv,
+    _scope_unit_is_active,
+    _worker_scope_unit_name,
+    _worker_unit_suffix,
+)
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
 if TYPE_CHECKING:
@@ -50,11 +58,6 @@ KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS = 30
 # a run's retained worker is only reaped once ended_at is at least this old
 # (two default dispatch ticks).
 TERMINAL_WORKER_REAP_GRACE_SECONDS = 120
-
-# The reaper releases a terminal run's systemd scope only within this window
-# after task_runs.ended_at; older residual scopes are left to operator-side,
-# ledger-checked exact-name cleanup.
-TERMINAL_WORKER_SCOPE_RELEASE_WINDOW_SECONDS = 1800
 
 # ---------------------------------------------------------------------------
 # Respawn guard constants
@@ -572,81 +575,6 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
                 conn, row["task_id"], "worker_scope_released", {"pid": pid, **scope}, run_id=row["id"])
     if alive:
         reaped.append(row["task_id"])
-
-
-def _worker_unit_suffix(task_id: str, run_id: int) -> str:
-    """The ``unit_suffix`` a run's worker scope is spawned under; shared by spawn and release."""
-    return f"kanban-{task_id}-run-{run_id}"
-
-
-def _worker_scope_unit_name(task_id: str, run_id: int) -> str:
-    """The exact transient scope unit a kanban worker for this run was spawned in.
-
-    Exact names only — never glob ``hermes-worker-*``: an operator blanket stop
-    killed live workers (incident 2026-10-16). Must match the ``unit_suffix``
-    ``_restart_safe_worker_argv`` spawns under (``_worker_unit_suffix``) plus the
-    ``hermes-worker-<suffix>`` + ``.scope`` naming in
-    ``tools.process_registry._systemd_scope_argv``. Upstream
-    PR #139844 introduces ``systemd_scope_unit_name()``; switch this call site to
-    it once that lands."""
-    return f"hermes-worker-{_worker_unit_suffix(task_id, run_id)}.scope"
-
-
-def _scope_unit_is_active(unit_name: str) -> bool:
-    """True only when ``systemctl --user is-active`` reports ``active`` or
-    ``activating``. No systemctl, any other state or any error is False: never
-    stop what we cannot see."""
-    import shutil
-
-    from tools.process_registry import systemd_user_bus_env
-
-    binary = shutil.which("systemctl")
-    if binary is None:
-        return False
-    try:
-        result = subprocess.run(
-            [binary, "--user", "is-active", unit_name],
-            capture_output=True,
-            timeout=10,
-            stdin=subprocess.DEVNULL,
-            env=systemd_user_bus_env(),
-            check=False,
-        )
-    except Exception:  # health: allow BLE001 -- never stop what we cannot see: any probe fault reads as not active
-        _kb._log.warning("kanban dispatch: systemctl is-active %s failed", unit_name, exc_info=True)
-        return False
-    return (result.stdout or b"").decode(errors="replace").strip() in ("active", "activating")
-
-
-def _release_terminal_worker_scope(conn, task_id: str, run_id: int, *, now: int, ended_at: int) -> dict:
-    """Stop the scope unit of a terminal run whose client is already gone (the
-    kanban mirror of the cron-side release path added in #139844; stop as #70716).
-
-    A ``--collect`` scope stays active while any straggler (a daemonised
-    grandchild, a client hung after ``kanban_complete``) keeps its cgroup
-    non-empty, so the reaper stops it by exact name. Best-effort and only within
-    ``TERMINAL_WORKER_SCOPE_RELEASE_WINDOW_SECONDS`` of ``ended_at``: older
-    residuals are left to operator-side, ledger-checked exact-name cleanup.
-    Returns an audit dict and never raises."""
-    try:
-        if now - ended_at > TERMINAL_WORKER_SCOPE_RELEASE_WINDOW_SECONDS:
-            return {"skipped": "outside_window"}
-        unit = _worker_scope_unit_name(task_id, run_id)
-        if not _scope_unit_is_active(unit):
-            return {"skipped": "not_active", "unit": unit}
-        from tools.process_registry import _stop_systemd_unit
-
-        if _stop_systemd_unit(unit):
-            _kb._log.info("kanban dispatch: released worker scope %s (task %s)", unit, task_id)
-            return {"released": True, "unit": unit}
-        _kb._log.warning("kanban dispatch: failed to release worker scope %s (task %s)", unit, task_id)
-        return {"released": False, "unit": unit}
-    except Exception:  # health: allow BLE001 -- best-effort release must never abort the reaper row
-        _kb._log.debug(
-            "kanban dispatch: worker scope release failed for run %s (task %s)",
-            run_id, task_id, exc_info=True,
-        )
-        return {"skipped": "error"}
 
 
 def _worker_survived_termination(termination: dict) -> bool:
@@ -2848,44 +2776,6 @@ def _open_worker_log(task: Task, board: Optional[str]):
     rotate_bytes, backup_count = worker_log_rotation_config()
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
     return open(log_path, "ab")
-
-
-def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
-    """Wrap a systemd-hosted dispatcher's worker in the shared restart-safe scope.
-
-    Kanban workers are long-lived agentic runs that outlive the dispatcher
-    tick, so they never take cron's degraded mode under the managed gateway:
-    ``require_restart_safe_scope=True`` makes the helper raise
-    ``RestartSafeScopeUnavailable`` there (an infrastructure spawn failure the
-    dispatcher does not charge to the card). Under any other systemd unit
-    (``Type=oneshot`` dispatch timers, #113612) ``outlives_parent=True`` gets the
-    worker its own scope so the unit's cgroup teardown cannot kill it.
-    """
-    from tools.process_registry import restart_safe_gateway_child_argv
-
-    if task.current_run_id is None:
-        # Outside managed systemd this is harmless, but a managed dispatch must
-        # never mint an untraceable worker.  Check topology through the shared
-        # helper first, using a placeholder suffix that cannot be launched.
-        dispatch = restart_safe_gateway_child_argv(
-            command,
-            unit_suffix=f"kanban-{task.id}-run-missing",
-            require_restart_safe_scope=True,
-            outlives_parent=True,
-        )
-        if dispatch.mode != "in_process":
-            raise RuntimeError(
-                "cannot create restart-safe systemd scope for Kanban worker: "
-                "the claimed task has no current run id"
-            )
-        return command
-
-    return restart_safe_gateway_child_argv(
-        command,
-        unit_suffix=_worker_unit_suffix(task.id, task.current_run_id),
-        require_restart_safe_scope=True,
-        outlives_parent=True,
-    ).argv
 
 
 def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:

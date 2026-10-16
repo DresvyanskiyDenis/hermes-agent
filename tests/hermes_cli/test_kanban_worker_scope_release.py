@@ -22,6 +22,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_dispatch_worker_scope as ws
 from tools import process_registry
 
 _EXACT_UNIT = re.compile(r"^hermes-worker-kanban-[A-Za-z0-9_-]+-run-\d+\.scope$")
@@ -55,7 +56,7 @@ def systemd(monkeypatch):
         fake.stop_calls.append(unit)
         return fake.stop_ok
 
-    monkeypatch.setattr(kbd, "_scope_unit_is_active", is_active)
+    monkeypatch.setattr(ws, "_scope_unit_is_active", is_active)
     monkeypatch.setattr(process_registry, "_stop_systemd_unit", stop)
     yield fake
     for unit in fake.is_active_calls + fake.stop_calls:
@@ -104,6 +105,7 @@ def _events(conn, tid: str, kind: str) -> list[dict]:
 def test_gone_client_with_active_scope_stops_the_exact_unit(conn, systemd):
     tid, run_id, pid = _completed_card_with_gone_worker(conn)
     unit = _unit_from_ledger(conn, run_id)
+    assert kbd._worker_scope_unit_name(tid, run_id) == unit  # facade re-export of the sibling's name
 
     kbd.reap_terminal_workers(conn)
 
@@ -226,10 +228,10 @@ def test_scope_is_active_only_for_active_or_activating(monkeypatch, stdout, expe
         calls.append((argv, kwargs))
         return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr=b"")
 
-    monkeypatch.setattr(kbd.subprocess, "run", run)
+    monkeypatch.setattr(ws.subprocess, "run", run)
     unit = "hermes-worker-kanban-t_1-run-2.scope"
 
-    assert kbd._scope_unit_is_active(unit) is expected
+    assert ws._scope_unit_is_active(unit) is expected
 
     [(argv, kwargs)] = calls
     assert argv == ["/usr/bin/systemctl", "--user", "is-active", unit]
@@ -243,8 +245,8 @@ def test_scope_is_active_is_false_when_systemctl_raises_or_is_missing(monkeypatc
     def boom(argv, **kwargs):
         raise subprocess.TimeoutExpired(argv, 10)
 
-    monkeypatch.setattr(kbd.subprocess, "run", boom)
-    assert kbd._scope_unit_is_active("hermes-worker-kanban-t_1-run-2.scope") is False
+    monkeypatch.setattr(ws.subprocess, "run", boom)
+    assert ws._scope_unit_is_active("hermes-worker-kanban-t_1-run-2.scope") is False
 
     monkeypatch.setattr("shutil.which", lambda name: None)
-    assert kbd._scope_unit_is_active("hermes-worker-kanban-t_1-run-2.scope") is False
+    assert ws._scope_unit_is_active("hermes-worker-kanban-t_1-run-2.scope") is False
