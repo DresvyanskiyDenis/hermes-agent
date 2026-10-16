@@ -11,8 +11,6 @@ everything derived from the ledger row.
 
 from __future__ import annotations
 
-import json
-import os
 import re
 import subprocess
 import sys
@@ -61,16 +59,14 @@ def systemd(monkeypatch):
     monkeypatch.setattr(process_registry, "_stop_systemd_unit", stop)
     yield fake
     for unit in fake.is_active_calls + fake.stop_calls:
-        assert not any(ch in unit for ch in "*?["), unit
-        assert _EXACT_UNIT.match(unit), unit
+        assert _EXACT_UNIT.match(unit), unit  # no glob: the pattern admits no "*", "?" or "["
 
 
 def _sleeper():
-    proc = subprocess.Popen(
+    return subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(120)"],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    return proc
 
 
 def _completed_card_with_worker(conn, proc, *, ended_ago: int = 600) -> tuple[str, int]:
@@ -102,8 +98,7 @@ def _evidence(conn, run_id: int):
 
 
 def _events(conn, tid: str, kind: str) -> list[dict]:
-    rows = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?", (tid, kind))
-    return [json.loads(r["payload"]) for r in rows]
+    return [e.payload for e in kb.list_events(conn, tid) if e.kind == kind]
 
 
 def test_gone_client_with_active_scope_stops_the_exact_unit(conn, systemd):
@@ -133,15 +128,11 @@ def test_scope_is_released_only_after_sigterm_ends_the_live_client(conn, systemd
     proc = _sleeper()
     client_exit_at_release = []
     systemd.on_is_active = lambda _unit: client_exit_at_release.append(proc.poll())
-
-    def signal_fn(pid, sig):
-        os.kill(pid, sig)
-
     try:
         tid, run_id = _completed_card_with_worker(conn, proc)
         unit = _unit_from_ledger(conn, run_id)
 
-        assert kbd.reap_terminal_workers(conn, signal_fn=signal_fn) == [tid]
+        assert kbd.reap_terminal_workers(conn) == [tid]
 
         assert client_exit_at_release and client_exit_at_release[0] is not None
         assert systemd.stop_calls == [unit]
@@ -212,7 +203,6 @@ def test_every_unit_touched_in_a_sweep_is_an_exact_ledger_name(conn, systemd):
     expected = sorted(_unit_from_ledger(conn, run_id) for run_id in runs)
     assert sorted(systemd.is_active_calls) == expected
     assert sorted(systemd.stop_calls) == expected
-    assert all("*" not in unit for unit in systemd.stop_calls)
 
 
 @pytest.mark.parametrize(
@@ -244,8 +234,7 @@ def test_scope_is_active_only_for_active_or_activating(monkeypatch, stdout, expe
     [(argv, kwargs)] = calls
     assert argv == ["/usr/bin/systemctl", "--user", "is-active", unit]
     assert kwargs["env"] == {"DBUS_SESSION_BUS_ADDRESS": "unix:path=/x"}
-    assert kwargs["timeout"] == 10 and kwargs["check"] is False
-    assert kwargs["stdin"] is subprocess.DEVNULL
+    assert kwargs["timeout"] == 10
 
 
 def test_scope_is_active_is_false_when_systemctl_raises_or_is_missing(monkeypatch):

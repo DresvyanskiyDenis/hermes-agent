@@ -552,7 +552,7 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
             return  # still alive: try again next tick
     # The client is provably gone from here on: release its scope before the evidence goes.
     scope = _release_terminal_worker_scope(
-        conn, row["task_id"], row["id"], now=int(time.time()), ended_at=int(row["ended_at"]))
+        conn, row["task_id"], row["id"], now=int(time.time()), ended_at=row["ended_at"])
     if "skipped" in scope:
         _kb._log.debug("kanban dispatch: worker scope release skipped for run %s: %s", row["id"], scope)
     with _kb.write_txn(conn):
@@ -574,16 +574,22 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
         reaped.append(row["task_id"])
 
 
+def _worker_unit_suffix(task_id: str, run_id: int) -> str:
+    """The ``unit_suffix`` a run's worker scope is spawned under; shared by spawn and release."""
+    return f"kanban-{task_id}-run-{run_id}"
+
+
 def _worker_scope_unit_name(task_id: str, run_id: int) -> str:
     """The exact transient scope unit a kanban worker for this run was spawned in.
 
     Exact names only — never glob ``hermes-worker-*``: an operator blanket stop
     killed live workers (incident 2026-10-16). Must match the ``unit_suffix``
-    computed in ``_restart_safe_worker_argv`` plus the ``hermes-worker-<suffix>``
-    + ``.scope`` naming in ``tools.process_registry._systemd_scope_argv``. Upstream
+    ``_restart_safe_worker_argv`` spawns under (``_worker_unit_suffix``) plus the
+    ``hermes-worker-<suffix>`` + ``.scope`` naming in
+    ``tools.process_registry._systemd_scope_argv``. Upstream
     PR #139844 introduces ``systemd_scope_unit_name()``; switch this call site to
     it once that lands."""
-    return f"hermes-worker-kanban-{task_id}-run-{run_id}.scope"
+    return f"hermes-worker-{_worker_unit_suffix(task_id, run_id)}.scope"
 
 
 def _scope_unit_is_active(unit_name: str) -> bool:
@@ -2876,7 +2882,7 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
 
     return restart_safe_gateway_child_argv(
         command,
-        unit_suffix=f"kanban-{task.id}-run-{task.current_run_id}",
+        unit_suffix=_worker_unit_suffix(task.id, task.current_run_id),
         require_restart_safe_scope=True,
         outlives_parent=True,
     ).argv
