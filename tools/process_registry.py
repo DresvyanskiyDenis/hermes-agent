@@ -1100,19 +1100,29 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         """Login-shell argv for *safe_command* (parity with LocalEnvironment: rc files
         sourced, user tools on PATH), wrapped in a transient systemd scope when we are
         the supervised gateway (own cgroup: an OOM kills only the worker, not the
-        gateway and its messaging control plane)."""
+        gateway and its messaging control plane) or inside a restart-safe cron execution.
+
+        The cron case keeps the execution's transient scope drainable: a detached
+        background job left in it holds the ``--collect`` unit ``active`` for days after
+        the ledger row went terminal, and the gateway's release of that unit would kill
+        the job. In its own unit the job follows its own lifetime (``--collect``)."""
         argv = [_find_shell(), "-lic", f"set +m; {safe_command}"]
+        # Late import: ``cron`` pulls in the scheduler, which imports this module.
+        from cron.worker_bootstrap import EXTERNAL_WORKER_ENV
+
         # This applies to both pipe mode and the PTY path above. See #70716.
         in_supervised_gateway = _IS_LINUX and _is_supervised_gateway_process()
-        if in_supervised_gateway and _systemd_run_user_scope_available():
+        in_cron_execution = _IS_LINUX and bool(os.environ.get(EXTERNAL_WORKER_ENV))
+        if (in_supervised_gateway or in_cron_execution) and _systemd_run_user_scope_available():
             session.systemd_unit = f"hermes-worker-{unit_suffix}.scope"
             return _build_systemd_scope_argv(argv, unit_suffix=unit_suffix)
-        if in_supervised_gateway:
-            # Under a supervisor but no private cgroup: a worker OOM can still take
-            # the whole gateway down.
+        if in_supervised_gateway or in_cron_execution:
+            # No private cgroup: a worker OOM can still take the whole gateway down, and a
+            # cron execution's background job keeps that execution's scope unit alive.
             logger.debug(
                 "%s background executor not isolated in a systemd scope "
-                "(systemd-run --user unavailable); worker shares the gateway cgroup.", label)
+                "(systemd-run --user unavailable); worker shares the %s cgroup.", label,
+                "gateway" if in_supervised_gateway else "cron execution")
         return argv
 
     @staticmethod
