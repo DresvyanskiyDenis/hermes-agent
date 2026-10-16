@@ -4,15 +4,27 @@
 worker already inside ``run_conversation``. Finalizing its SessionDB from ``run_job``'s
 ``finally`` would close a handle the worker is still writing to — the checkpoint/WAL-unlink
 overlap behind #102827. The worker's Future owns the teardown instead.
+
+Also: release of a restart-safe worker's transient scope unit once its ledger row is terminal.
 """
 
 from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import logging
 import subprocess
 import threading
+import time
 from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+SCOPE_RELEASE_GRACE_SECONDS = 60.0  # let cleanly-exiting stragglers drain first
+SCOPE_RELEASE_POLL_SECONDS = 5.0
+# Ledger acceptance bound: a terminalized execution's unit must never stay loaded-active
+# more than 30 min.
+SCOPE_RELEASE_DEADLINE_SECONDS = 1800.0
 
 
 def _close_late_session_db_result(future: concurrent.futures.Future) -> None:
@@ -66,5 +78,107 @@ def reap_terminal_worker_in_background(process: subprocess.Popen) -> None:
     threading.Thread(
         target=process.wait,
         name=f"cron-worker-reap-{getattr(process, 'pid', '?')}",
+        daemon=True,
+    ).start()
+
+
+def build_cron_worker_unit_name(job_id: str, execution_id: str) -> str:
+    """The transient scope unit ``_launch_external_cron_worker`` dispatches the worker into.
+
+    Must match ``tools.process_registry._build_systemd_scope_argv(command,
+    unit_suffix=f"cron-{job_id}-exec-{execution_id}")``: an exact name is the only thing
+    the release below may ever stop.
+    """
+    return f"hermes-worker-cron-{job_id}-exec-{execution_id}.scope"
+
+
+def _scope_unit_is_active(unit_name: str) -> bool:
+    """True only when ``systemctl --user is-active`` reports active/activating.
+
+    Any failure (no systemctl, no user bus, timeout) reads as NOT active: never stop
+    what we cannot see.
+    """
+    import shutil
+
+    from tools.process_registry import systemd_user_bus_env
+
+    binary = shutil.which("systemctl")
+    if binary is None:
+        return False
+    try:
+        result = subprocess.run(
+            [binary, "--user", "is-active", unit_name],
+            capture_output=True, timeout=10, stdin=subprocess.DEVNULL,
+            env=systemd_user_bus_env(), check=False,
+        )
+    except Exception as exc:
+        logger.debug("systemctl --user is-active %s failed: %s", unit_name, exc, exc_info=True)
+        return False
+    return (result.stdout or b"").decode(errors="replace").strip().startswith("active")
+
+
+def schedule_scope_unit_release(
+    process: subprocess.Popen,
+    scope_unit: str,
+    *,
+    grace_seconds: float = SCOPE_RELEASE_GRACE_SECONDS,
+    poll_seconds: float = SCOPE_RELEASE_POLL_SECONDS,
+    deadline_seconds: float = SCOPE_RELEASE_DEADLINE_SECONDS,
+) -> None:
+    """Reap the worker, then release its transient scope unit if something still holds it.
+
+    A restart-safe worker runs in a ``systemd-run --scope --collect`` unit, which systemd
+    only deactivates once its cgroup is empty. Any process still in it after the worker
+    committed its terminal row and exited — a ``start_new_session`` background job, a
+    grandchild detached by the bot session — keeps the unit ``loaded active running``
+    for days. Nothing else ever stops that unit.
+
+    Only-then semantics: this is scheduled exclusively from waiter paths that have
+    already confirmed the ledger row terminal or the owner provably gone, so nothing in
+    the unit still owns the execution. A worker stuck in teardown past
+    ``deadline_seconds`` is killed, as kanban's ``reap_terminal_workers`` does for a
+    worker that outlived its terminal ledger row (#111791). It subsumes
+    :func:`reap_terminal_worker_in_background` (#114509): the same thread calls
+    ``wait()``.
+
+    Stragglers get ``grace_seconds`` to drain on their own; whatever remains is
+    stopped by the EXACT unit name. Operator lesson: never glob ``hermes-worker-*``,
+    which would also stop live workers and background jobs in their own units.
+    """
+    def _release() -> None:
+        try:
+            try:
+                process.wait(timeout=deadline_seconds)
+            except subprocess.TimeoutExpired:
+                logger.warning(
+                    "Cron worker pid %s still running %s s after its ledger row went terminal; "
+                    "killing it to release scope unit %s",
+                    process.pid, deadline_seconds, scope_unit,
+                )
+                with contextlib.suppress(Exception):
+                    process.kill()
+                with contextlib.suppress(Exception):
+                    process.wait(timeout=30)
+            grace_ends = time.monotonic() + grace_seconds
+            while time.monotonic() < grace_ends:
+                if not _scope_unit_is_active(scope_unit):
+                    return
+                time.sleep(poll_seconds)
+            from tools.process_registry import _stop_systemd_unit
+
+            if _stop_systemd_unit(scope_unit):
+                logger.info(
+                    "Released restart-safe cron worker scope unit %s (worker reaped, ledger terminal)",
+                    scope_unit,
+                )
+            else:
+                logger.warning("Could not release restart-safe cron worker scope unit %s", scope_unit)
+        except Exception as exc:
+            # Best-effort reclamation: must never surface to the gateway tick.
+            logger.debug("Releasing cron worker scope unit %s failed: %s", scope_unit, exc, exc_info=True)
+
+    threading.Thread(
+        target=_release,
+        name=f"cron-scope-release-{getattr(process, 'pid', '?')}",
         daemon=True,
     ).start()
