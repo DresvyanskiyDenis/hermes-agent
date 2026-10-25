@@ -490,6 +490,10 @@ def test_clean_update_escalates_surviving_serve_as_unaccounted(
     # (3) was "partial": a success that names the owed restart.
     assert receipt["outcome"] == "success"
     assert [f["step"] for f in receipt["followups"]] == ["gateway_restart"]
+    # The machine-readable copy of the run must not contradict its own warning: the restart phase
+    # recorded its block before verification found the miss, so it read "incomplete": false next to
+    # an owed restart (the shape that let a stopped gateway look like a clean update).
+    assert receipt["gateway_restart"]["incomplete"] is True
     from hermes_cli import update_cmd_fleet
     assert update_cmd_fleet._fleet_restart_obligation_armed()
     # (2) the reconciliation verdict is unchanged.

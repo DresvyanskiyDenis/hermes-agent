@@ -1567,8 +1567,16 @@ def _verify_relaunched_gateways_alive(token: dict, profiles: dict, unmapped: lis
 
 
 def _resume_windows_gateways_after_update(token: dict | None) -> None:
-    """Restart Windows profile gateways previously paused for update."""
+    """Restart Windows profile gateways previously paused for update.
+
+    A caller that synced this tree's dependencies itself (an update's completion) marks the token
+    with ``deps_synced``; it is transient, read and removed here, so the tree gate never holds the
+    set for a currency probe the caller is the authority on. It rides the token rather than a
+    parameter because this is a frozen ``hermes_cli.main`` surface old on-disk updaters call
+    positionally.
+    """
     from hermes_cli.update_cmd import _m
+    deps_synced = bool(isinstance(token, dict) and token.pop("deps_synced", False))
     if not token or not token.get("resume_needed"):
         return
     # The foreground call sites register this same function via atexit as a safety net for
@@ -1585,14 +1593,14 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
     # Startup recovery runs ahead of an unrelated command whose stdout may be parsed (``--json``):
     # its notices go to stderr, as ``recover()``'s own do.
     with redirect_stdout(sys.stderr) if token.get("recovery") else nullcontext():
-        _resume_unless_torn(token)
+        _resume_unless_torn(token, deps_synced=deps_synced)
 
 
-def _resume_unless_torn(token: dict) -> None:
+def _resume_unless_torn(token: dict, *, deps_synced: bool = False) -> None:
     """Resume the paused set, or leave it owed when the checkout is not whole."""
     from hermes_cli import update_pause_record as pause_record
     if token.get("pause_id"):
-        whole, why = pause_record.tree_is_whole(token)
+        whole, why = pause_record.tree_is_whole(token, deps_synced=deps_synced)
         if not whole:
             # Starting gateways now would boot them on a half-written tree or the pre-sync
             # dependencies. The durable record keeps the obligation for the next launch, which
@@ -1605,6 +1613,7 @@ def _resume_unless_torn(token: dict) -> None:
             return
     try:
         _resume_paused_set(token)
+        token.pop("resume_deferred", None)  # this attempt re-judged the tree: the deferral is spent
     finally:
         pause_record.sync(token)
 
@@ -1655,10 +1664,31 @@ def _resume_paused_set(token: dict) -> None:
     token["resume_needed"] = False
 
 
+def _retry_deferred_pause_set(token) -> None:
+    """Re-arm a paused set an earlier phase of THIS run left stopped.
+
+    The pre-build resume can defer (a tree/dependency gate); that deferral used to hand the set to
+    the next launch only. The run that STOPPED those gateways then finished without trying to start
+    them again: the fleet restart enumerates ACTIVE units, so a stopped unit was invisible to it, the
+    plan's runtime came back "never touched", and the update still reported success. This call runs
+    after the builds and the maintenance, when both gates have had their chance to clear.
+    """
+    if not isinstance(token, dict) or not token.get("resume_deferred"):
+        return
+    print(f"  → Retrying the paused gateway restart deferred earlier ({token['resume_deferred']})")
+    token.pop("resume_deferred", None)
+    token["resume_needed"] = True
+
+
 def _resume_windows_gateways_and_merge_outcome(outcome, _windows_gateway_resume, gateway_mode: bool):
     """Resume gateways paused for a Windows update and fold the token into ``outcome``'s systemd/launchd-style
     bookkeeping so reconciliation never reports a healthy gateway as unaccounted. Must never abort the update."""
     from hermes_cli.update_cmd import _m
+    # This phase runs after the dependency sync and the builds: the tree gate's dependency hold
+    # cannot apply to it (see ``tree_is_whole``'s ``deps_synced``).
+    _retry_deferred_pause_set(_windows_gateway_resume)
+    if isinstance(_windows_gateway_resume, dict):
+        _windows_gateway_resume["deps_synced"] = True
     try:
         _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
     except Exception as _windows_resume_exc:
@@ -1667,6 +1697,9 @@ def _resume_windows_gateways_and_merge_outcome(outcome, _windows_gateway_resume,
         outcome.incomplete = True
         outcome.phase_errors.append(str(_windows_resume_exc))
         print(f"  ⚠ Windows gateway service restart incomplete: {_windows_resume_exc}")
+    finally:
+        if isinstance(_windows_gateway_resume, dict):
+            _windows_gateway_resume.pop("deps_synced", None)  # transient: never into the record
     if not isinstance(_windows_gateway_resume, dict):
         return
 

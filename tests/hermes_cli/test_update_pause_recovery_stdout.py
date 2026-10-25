@@ -15,7 +15,13 @@ from hermes_cli.update_cmd_windows import _resume_windows_gateways_after_update
 def test_a_recovering_resume_prints_its_notices_to_stderr(monkeypatch, capsys):
     from hermes_cli import main
     monkeypatch.setattr(main, "_is_windows", lambda: True)
-    monkeypatch.setattr(pause_record, "tree_is_whole", lambda token: (False, "the checkout is mid-pull"))
+    gate: dict = {}
+
+    def tree_is_whole(token, _root=None, *, deps_synced=False):
+        gate["deps_synced"] = deps_synced
+        return False, "the checkout is mid-pull"
+
+    monkeypatch.setattr(pause_record, "tree_is_whole", tree_is_whole)
     token = {"resume_needed": True, "pause_id": "p", "recovery": True, "profiles": {"default": 4242}}
 
     _resume_windows_gateways_after_update(token)
@@ -23,3 +29,5 @@ def test_a_recovering_resume_prints_its_notices_to_stderr(monkeypatch, capsys):
     assert out == "", "recovery wrote to the unrelated command's stdout"
     assert "left stopped: the checkout is mid-pull" in err
     assert token["resume_deferred"] == "the checkout is mid-pull"
+    # Recovery runs BEFORE ``venv_sync.prepare_launch``: it never claims the dependency sync.
+    assert gate["deps_synced"] is False

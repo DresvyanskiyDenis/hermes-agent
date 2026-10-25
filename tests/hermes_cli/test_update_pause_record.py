@@ -854,6 +854,32 @@ def test_a_moved_head_holds_gateways_for_dependencies_only_where_a_launch_syncs_
     assert not holds or "dependencies" in why
 
 
+def test_a_dependency_probe_never_holds_a_resume_whose_run_synced_them(tmp_path, monkeypatch):
+    """``hermes update`` syncs THIS tree's dependencies before it resumes the gateways it stopped at
+    the commit point, so the currency probe cannot tell that resume anything. A probe that disagreed
+    kept the whole set stopped for the rest of the run: the post-restart fleet sweep only enumerates
+    ACTIVE units, so the stopped unit was invisible to it and nothing in that run ever started it
+    again. Recovery keeps the hold — it runs before the launch-time dependency sync."""
+    import pm
+    from hermes_cli import steward
+    root = tmp_path / "checkout"
+    root.mkdir()
+    _git(root, "init", "-q")
+    (root / "pyproject.toml").write_text("[project]\nname = 'x'\n", encoding="utf-8")
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "v1")
+    token = pause_record.stamp_tree({"resume_needed": True}, root)
+    _git(root, "commit", "-q", "--allow-empty", "-m", "v2")  # the update moved HEAD
+    monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
+    monkeypatch.setattr(steward, "read_install_stamp", lambda r: {"updateMechanism": "self"})
+    monkeypatch.setattr(pm, "venv_is_current", lambda **kw: False)  # the probe disagrees
+
+    assert pause_record.tree_is_whole(token, root) == (
+        False, "dependencies are not current for the updated code yet"), "recovery lost its hold"
+    assert pause_record.tree_is_whole(token, root, deps_synced=True) == (True, ""), (
+        "the update's own resume was held for a probe its sync already answered")
+
+
 def test_an_unmoved_head_holds_gateways_only_for_paths_the_updates_move_could_write(tmp_path):
     """Review 5411136378 decision (same HEAD): a tracked file a build/sync step rewrote is not git's
     half-written checkout; holding the set for it kept gateways stopped on every later launch."""
