@@ -370,8 +370,17 @@ def _paused_on_unreadable_head(token: dict) -> bool:
         for b in baselines)
 
 
-def tree_is_whole(token: dict, root: Path | None = None) -> tuple[bool, str]:
-    """May paused gateways start on this checkout now? ``(verdict, reason when not)``."""
+def tree_is_whole(token: dict, root: Path | None = None, *, deps_synced: bool = False) -> tuple[bool, str]:
+    """May paused gateways start on this checkout now? ``(verdict, reason when not)``.
+
+    ``deps_synced`` is the caller's own proof that THIS tree's dependencies were synced by the run
+    asking (``hermes update``'s completion syncs them before it resumes; the recovery path has no
+    such proof). With it the dependency hold cannot apply: the caller already synced, so the
+    currency probe's verdict cannot tell it anything it does not know. Holding on that verdict kept
+    an update's own gateways stopped for the rest of the run — nothing later started a unit that was
+    no longer ACTIVE for the fleet sweep to find. Without it the hold keeps its launch-time job: a
+    recovery runs before ``venv_sync.prepare_launch`` and must let that sync happen first.
+    """
     from hermes_cli._early_recovery import interrupted_pull_marker
     root = root or install_root()
     if (root / ".git").exists():
@@ -399,7 +408,7 @@ def tree_is_whole(token: dict, root: Path | None = None) -> tuple[bool, str]:
                 return False, f"the checkout has {len(torn)} file(s) git left half-written (e.g. {torn[0]})"
             if at_head:
                 return True, ""
-    if _deps_hold_resume(root):
+    if not deps_synced and _deps_hold_resume(root):
         return False, "dependencies are not current for the updated code yet"
     return True, ""
 

@@ -459,16 +459,23 @@ def _resume_paused_before_build(request: dict) -> None:
     published, the product builds (minutes) have not started. A gateway needs nothing later to
     boot. A failure stays owed: the post-build resume retries it and records the outcome.
 
+    The dependency sync this phase follows is the reason the resume is not gated on dependency
+    currency (``deps_synced``): ``_prepare`` synced THIS tree before this child existed, so the
+    probe has nothing to add and must not hold the set stopped for the rest of the run.
+
     POSIX only: the fleet restart skips what this restarted (``already_restarted``). A Windows set
     keeps resuming after the fleet restart, which would otherwise drain it a second time."""
     token = request.get("windows_resume")
     if not token or not token.get("resume_needed") or token.get("platform") != "posix":
         return
     from hermes_cli.update_cmd import _m
+    token["deps_synced"] = True
     try:
         _m()._resume_windows_gateways_after_update(token)
     except Exception as exc:  # health: allow BLE001 -- retried (and recorded) after the build
         print(f"  ⚠ Paused gateway restart incomplete ({exc}); retrying after the build")
+    finally:
+        token.pop("deps_synced", None)  # transient: the helper consumes it, the record must not carry it
 
 
 class _ForwardedOutput:

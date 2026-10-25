@@ -410,6 +410,11 @@ def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_re
         record_followup("gateway_restart", _owed_restart_reason(
             restart, stopped, gateway_owed=_gateway_owed, stale_serves=_stale_serves_owed,
             down_serves=set(_dashboards_down or ())))
+        # The restart phase recorded its block BEFORE verification knew the restart was owed, so
+        # latest.json said ``"incomplete": false`` next to a ``gateway_restart`` follow-up — the
+        # machine-readable copy of the run contradicted its own warning. Re-record with what
+        # verification proved (the phase errors it carried included).
+        restart.record_receipt(phase_error="; ".join(getattr(restart, "phase_errors", []) or []) or None)
         with _best_effort('Fleet restart inventory not recorded: %s'):
             _record_owed_gateway_inventory(_pre_update_plan, stopped)
     with _best_effort('Update receipt finalize failed: %s'):
